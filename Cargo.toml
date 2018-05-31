@@ -4,3 +4,8 @@ version = "0.1.0"
 authors = ["SeongChan Lee <foriequal@gmail.com>"]
 
 [dependencies]
+cgmath = "0.16.1"
+rayon = "1.0.1"
+palette = "0.4"
+png = "0.12.0"
+num-traits = "0.2"
