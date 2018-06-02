@@ -1,3 +1,4 @@
+use std;
 use palette::{LinSrgb, Component, IntoColor};
 use palette::rgb::{Rgb, RgbSpace};
 use palette::encoding::Linear;
@@ -16,7 +17,9 @@ impl PhotonAccumulator {
         S: RgbSpace<WhitePoint = D65>,
         T: Component
     {
-        (self.sum / self.weight_sum).into_rgb().into_format()
+        let avg = if self.weight_sum < std::f32::EPSILON { Rgb::new(0.0, 0.0, 0.0) }
+            else { self.sum / self.weight_sum };
+        avg.into_rgb().into_format()
     }
 
     pub fn accumulate(&mut self, photon: LinSrgb) {
