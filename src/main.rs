@@ -5,8 +5,10 @@ extern crate num_traits;
 #[macro_use]
 extern crate palette;
 extern crate png;
+extern crate stopwatch;
 
-use cgmath::{Angle, Deg, EuclideanSpace, InnerSpace, Point3, Vector2, Vector3};
+use cgmath::{Angle, Deg, EuclideanSpace, InnerSpace,
+             Point2, Point3, Vector2, Vector3, Matrix3};
 use image::Image;
 use palette::{LinSrgb, Srgb};
 use photon::PhotonAccumulator;
@@ -27,6 +29,12 @@ struct Camera {
     near: f32,
 }
 
+struct Ray {
+    origin: Point3<f32>,
+    direction: Vector3<f32>,
+    hint: Option<PrimitiveIndex>,
+}
+
 impl Camera {
     fn shoot(&self, clip: &Vector2<f32>) -> Ray {
         let toward = self.toward.normalize();
@@ -40,20 +48,7 @@ impl Camera {
         Ray {
             origin,
             direction,
-        }
-    }
-}
-
-struct Ray {
-    origin: Point3<f32>,
-    direction: Vector3<f32>,
-}
-
-impl Camera {
-    fn shoot_into(screen_position: Point3<f32>) -> Ray {
-        Ray {
-            origin: (0.0, 0.0, 0.0).into(),
-            direction: (0.0, 0.0, 0.0).into(),
+            hint: Option::None,
         }
     }
 }
@@ -107,6 +102,11 @@ struct Triangle<T> {
     vertices: [T; 3],
 }
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum PrimitiveIndex {
+    Sphere(usize), Triangle(usize)
+}
+
 impl<T: HasPosition> Triangle<T> {
     fn face_normal(&self) -> Vector3<f32> {
         let a = self.vertices[1].get_position() - self.vertices[0].get_position();
@@ -153,7 +153,7 @@ impl HasPosition for PositionNormal {
 #[derive(Clone, Copy)]
 struct PositionUV {
     position: Point3<f32>,
-    uv: Point3<f32>,
+    uv: Point2<f32>,
 }
 
 impl HasPosition for PositionUV {
@@ -166,7 +166,7 @@ impl HasPosition for PositionUV {
 struct PositionNormalUV {
     position: Point3<f32>,
     normal: Vector3<f32>,
-    uv: Point3<f32>,
+    uv: Point2<f32>,
 }
 
 impl HasPosition for PositionNormalUV {
@@ -218,6 +218,12 @@ struct World {
     lights: Vec<Light>,
 }
 
+struct Hit<'a> {
+    object: &'a Object,
+    index: PrimitiveIndex,
+    at: PositionNormalUV,
+}
+
 impl World {
     fn new() -> World {
         World {
@@ -238,20 +244,29 @@ impl World {
         self.lights.push(light);
     }
 
-    fn cast(&self, ray: Ray, front: bool) -> f32 {
-        for triangle in &self.triangles {
-            let backface = triangle.backface(&ray.direction);
-            if front && backface || !front && !backface {
-                continue;
-            }
-            let n = triangle.face_normal();
-            let d = n.dot(triangle.vertices[0].position.to_vec());
-            let t = d - n.dot(ray.origin.to_vec()) / n.dot(ray.direction);
-            if t < 0.0 {
+    fn cast(&self, ray: Ray, front: bool) -> Option<Hit> {
+        let mut some_nearest_t = Option::None;
+        let mut some_nearest_result = Option::None;
+        for (i, triangle) in self.triangles.iter().enumerate() {
+            if ray.hint == PrimitiveIndex::Triangle(i).into() {
+                // cast가 시작한 객체랑 같음
                 continue;
             }
 
-            let q = ray.origin + ray.direction * t;
+            let backface = triangle.backface(&ray.direction);
+            if front && backface || !front && !backface {
+                // 뒤집어짐
+                continue;
+            }
+            let face_normal = triangle.face_normal();
+            let d = face_normal.dot(triangle.vertices[0].position.to_vec());
+            let t = (d - face_normal.dot(ray.origin.to_vec())) / face_normal.dot(ray.direction);
+            if t <= 0.0 {
+                // 광선 진행방향 뒷편에 존재함
+                continue;
+            }
+
+            let position = ray.origin + ray.direction * t;
 
             let v = [
                 triangle.vertices[0].position,
@@ -259,16 +274,87 @@ impl World {
                 triangle.vertices[2].position,
             ];
 
-            let a = (v[1] - v[0]).cross(q - v[0]).dot(n);
-            let b = (v[2] - v[1]).cross(q - v[1]).dot(n);
-            let c = (v[0] - v[2]).cross(q - v[2]).dot(n);
+            let area = [
+                (v[2] - v[1]).cross(position - v[1]).dot(face_normal),
+                (v[0] - v[2]).cross(position - v[2]).dot(face_normal),
+                (v[1] - v[0]).cross(position - v[0]).dot(face_normal),
+            ];
 
-            if a < 0.0 || b < 0.0 || c < 0.0 {
+            if area.iter().any(|x| *x < 0.0) {
+                // 삼각형 밖에 존재함
                 continue;
             }
-            return t;
+
+            if let Option::Some(nearest_t) = some_nearest_t {
+                if nearest_t < t {
+                    continue;
+                }
+            }
+
+            let area_of_triangle = (v[1] - v[0]).cross(v[2] - v[0]).dot(face_normal);
+            let barycentric = Vector3::from(area) / area_of_triangle;
+            let normals = Matrix3::from_cols(
+                triangle.vertices[0].normal,
+                triangle.vertices[1].normal,
+                triangle.vertices[2].normal
+            );
+            let uvs = [
+                triangle.vertices[0].uv.to_vec(),
+                triangle.vertices[1].uv.to_vec(),
+                triangle.vertices[2].uv.to_vec()
+            ];
+
+            let normal = normals * barycentric;
+            let uv = Point2::from_vec(uvs[0] * barycentric[0] + uvs[1] * barycentric[1] + uvs[2] * barycentric[2]);
+            some_nearest_t = t.into();
+            some_nearest_result = Hit {
+                object: &self.objects[triangle.object_index.0],
+                index: PrimitiveIndex::Triangle(i),
+                at: PositionNormalUV { position, normal, uv }
+            }.into();
         }
-        std::f32::MAX
+
+        for (i, sphere) in self.spheres.iter().enumerate() {
+            if ray.hint == PrimitiveIndex::Sphere(i).into() {
+                // cast가 시작한 객체랑 같음
+                continue;
+            }
+
+            let distance = (sphere.geometry.center - ray.origin).cross(ray.direction).magnitude();
+            if distance > sphere.geometry.radius {
+                continue
+            }
+
+            let displacement = sphere.geometry.center - ray.origin;
+            let tc = ray.direction.dot(displacement);
+            if tc < 0.0 {
+                continue;
+            }
+
+            let k = (sphere.geometry.radius.powi(2) - distance.powi(2)).sqrt();
+            let t = if front { tc - k } else { tc + k };
+
+            if let Option::Some(nearest_t) = some_nearest_t {
+                if nearest_t < t {
+                    continue;
+                }
+            }
+
+            let position = ray.origin + ray.direction * t;
+            let normal = (position - sphere.geometry.center).normalize();
+            let uv = Point2 {
+                x: normal.y.acos() / std::f32::consts::PI,
+                y: normal.z.atan2(normal.x) / (std::f32::consts::PI * 2.0) + 0.5,
+            };
+
+            some_nearest_t = t.into();
+            some_nearest_result = Hit {
+                object: &self.objects[sphere.object_index.0],
+                index: PrimitiveIndex::Sphere(i),
+                at: PositionNormalUV { position, normal, uv }
+            }.into();
+        }
+        some_nearest_result
     }
 }
 
@@ -332,35 +418,80 @@ fn main() {
             })
         })
         .push_triangles(&square(&[
-            PositionUV { position: (-0.5, 0.0, -0.5).into(), uv: (0.0, 0.0, 0.0).into() },
-            PositionUV { position: (-0.5, 0.0, 0.5).into(), uv: (0.0, 0.0, 0.0).into() },
-            PositionUV { position: (0.5, 0.0, 0.5).into(), uv: (0.0, 0.0, 0.0).into() },
-            PositionUV { position: (0.5, 0.0, -0.5).into(), uv: (0.0, 0.0, 0.0).into() }
+            PositionUV { position: (-0.5, 0.0, -0.5).into(), uv: (0.0, 0.0).into() },
+            PositionUV { position: (-0.5, 0.0, 0.5).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.5, 0.0, 0.5).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (0.5, 0.0, -0.5).into(), uv: (0.0, 1.0).into() }
         ]));
+    world
+        .push_object(Object {
+            material: Rc::new(ColorMaterial {
+                diffuse: (0.5, 1.0, 0.2).into(),
+                specular: consts::linsrgb::white(),
+            })
+        })
+        .push_sphere(&SphereGeometry{
+            center: (0.0, 0.5, 0.0).into(),
+            radius: 0.5,
+        });
 
     world.push_light(Directional {
-        direction: Vector3::from((1.0, -1.0, 1.0)).normalize(),
+        direction: Vector3::from((-1.0, -1.0, 0.0)).normalize(),
         color: (1.0, 0.98, 0.95).into(),
     }.into());
 
     let camera = Camera {
         fovy: Deg(60.0).into(),
-        center: (5.0, 5.0, 5.0).into(),
+        center: (2.0, 2.5, 2.0).into(),
         toward: Vector3::from((-1.0, -1.0, -1.0)).normalize(),
         up: Vector3::from((0.0, 1.0, 0.0)).normalize(),
         near: -0.1,
     };
 
-    for (y, x) in iproduct!(0..img.height, 0..img.width) {
+    let sw = stopwatch::Stopwatch::start_new();
+    for (i, (y, x)) in iproduct!(0..img.height, 0..img.width).enumerate() {
         let clip_y = (img.height as f32 / 2.0 - y as f32) / img.height as f32;
         let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
 
         let ray = camera.shoot(&(clip_x, clip_y).into());
         let hit = world.cast(ray, true);
-        if hit != std::f32::MAX {
-            img[(x, y)].accumulate(consts::linsrgb::white())
-        } else {
-            img[(x, y)].accumulate(consts::linsrgb::black())
+
+        if hit.is_none() {
+            continue;
+        }
+        let hit = hit.unwrap();
+        let material = &hit.object.material;
+        let normal = hit.at.normal;
+
+        for light in &world.lights {
+            match light {
+                Light::Directional(light) => {
+                    let shadow_ray = Ray {
+                        origin: hit.at.position,
+                        direction: -light.direction,
+                        hint: hit.index.into(),
+                    };
+                    let in_shadow = world.cast(shadow_ray, true).is_some();
+                    if in_shadow {
+                        continue;
+                    }
+                    let intensity = -light.direction.dot(normal);
+                    if intensity <= 0.0 {
+                        continue;
+                    }
+                    let diffuse = material.get_diffuse() * light.color * intensity;
+                    img[(x, y)].accumulate(diffuse);
+                },
+                _ => {
+                    unreachable!();
+                }
+            }
+        }
+
+        if i % 10000 == 0 {
+            let i = i as i64;
+            let elapsed = sw.elapsed_ms();
+            println!("{} rays in {} ms (avg: {} ray/s)", i, elapsed, i/elapsed * 1000);
         }
     }
 
