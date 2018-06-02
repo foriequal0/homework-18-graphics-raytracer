@@ -1,11 +1,8 @@
-use std::vec::Vec;
+use palette::{Component, IntoColor, Pixel};
+use palette::rgb::{Rgb, RgbSpace, RgbStandard};
 use std::iter;
 use std::ops::{Index, IndexMut};
-
-use palette::{IntoColor, Component, Pixel};
-use palette::rgb::{Rgb, RgbStandard, RgbSpace};
-
-use ::photon::PhotonAccumulator;
+use std::vec::Vec;
 
 pub struct Image<P> {
     pub width: usize,
