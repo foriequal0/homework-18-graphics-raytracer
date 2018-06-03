@@ -7,7 +7,8 @@ extern crate palette;
 extern crate png;
 extern crate stopwatch;
 
-use cgmath::{Angle, Deg, EuclideanSpace, InnerSpace,
+use cgmath::{Angle, Rad, Deg,
+             EuclideanSpace, InnerSpace,
              Point2, Point3, Vector2, Vector3, Matrix3};
 use image::Image;
 use palette::{LinSrgb, Srgb};
@@ -16,6 +17,7 @@ use png::{Encoder, HasParameters};
 use std::convert::{From, Into};
 use std::fs::File;
 use std::rc::Rc;
+use std::borrow::Borrow;
 
 mod photon;
 mod image;
@@ -29,10 +31,19 @@ struct Camera {
     near: f32,
 }
 
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum FaceDirection {
+    Front,
+    Back,
+    Both
+}
+
 struct Ray {
     origin: Point3<f32>,
     direction: Vector3<f32>,
-    hint: Option<PrimitiveIndex>,
+    exclude: Option<PrimitiveIndex>,
+    face_direction: FaceDirection,
 }
 
 impl Camera {
@@ -48,21 +59,28 @@ impl Camera {
         Ray {
             origin,
             direction,
-            hint: Option::None,
+            exclude: Option::None,
+            face_direction: FaceDirection::Front,
         }
     }
 }
 
 trait Material {
     fn get_diffuse(&self) -> LinSrgb;
-    fn get_specular(&self) -> LinSrgb;
+    fn get_specular(&self) -> Specular;
 
     fn get_normal(&self) -> Vector3<f32>;
 }
 
 struct ColorMaterial {
     diffuse: LinSrgb,
-    specular: LinSrgb,
+    specular: Specular,
+}
+
+#[derive(Clone, Copy)]
+struct Specular {
+    color: LinSrgb,
+    shiness: f32,
 }
 
 impl Material for ColorMaterial {
@@ -70,7 +88,7 @@ impl Material for ColorMaterial {
         self.diffuse
     }
 
-    fn get_specular(&self) -> LinSrgb {
+    fn get_specular(&self) -> Specular {
         self.specular
     }
 
@@ -181,13 +199,15 @@ struct Directional {
 }
 
 struct Spot {
+    origin: Point3<f32>,
     direction: Vector3<f32>,
-    steradian: f32,
+    angle: Rad<f32>,
+    softness: f32,
     color: LinSrgb,
 }
 
 struct Point {
-    direction: Vector3<f32>,
+    origin: Point3<f32>,
     color: LinSrgb,
 }
 
@@ -240,21 +260,23 @@ impl World {
         }
     }
 
-    fn push_light(&mut self, light: Light) {
-        self.lights.push(light);
+    fn push_light<L:Into<Light>>(&mut self, light: L) {
+        self.lights.push(light.into());
     }
 
-    fn cast(&self, ray: Ray, front: bool) -> Option<Hit> {
+    fn cast(&self, ray: &Ray) -> Option<Hit> {
         let mut some_nearest_t = Option::None;
         let mut some_nearest_result = Option::None;
         for (i, triangle) in self.triangles.iter().enumerate() {
-            if ray.hint == PrimitiveIndex::Triangle(i).into() {
+            if ray.exclude == PrimitiveIndex::Triangle(i).into() {
                 // cast가 시작한 객체랑 같음
                 continue;
             }
 
             let backface = triangle.backface(&ray.direction);
-            if front && backface || !front && !backface {
+            if (ray.face_direction == FaceDirection::Front && backface)
+                || (ray.face_direction == FaceDirection::Back && !backface)
+            {
                 // 뒤집어짐
                 continue;
             }
@@ -315,7 +337,7 @@ impl World {
         }
 
         for (i, sphere) in self.spheres.iter().enumerate() {
-            if ray.hint == PrimitiveIndex::Sphere(i).into() {
+            if ray.exclude == PrimitiveIndex::Sphere(i).into() {
                 // cast가 시작한 객체랑 같음
                 continue;
             }
@@ -332,7 +354,11 @@ impl World {
             }
 
             let k = (sphere.geometry.radius.powi(2) - distance.powi(2)).sqrt();
-            let t = if front { tc - k } else { tc + k };
+            let t = match ray.face_direction{
+                FaceDirection::Front => tc - k,
+                FaceDirection::Back => tc + k,
+                FaceDirection::Both => if tc > k { tc - k } else {tc + k}
+            };
 
             if let Option::Some(nearest_t) = some_nearest_t {
                 if nearest_t < t {
@@ -407,14 +433,17 @@ fn square(vertices: &[PositionUV; 4]) -> [[PositionNormalUV; 3]; 2] {
 }
 
 fn main() {
-    let mut img = Image::<PhotonAccumulator>::new(320, 240);
+    let mut img = Image::<LinSrgb>::new(640, 480);
 
     let mut world = World::new();
     world
         .push_object(Object {
             material: Rc::new(ColorMaterial {
                 diffuse: (1.0, 0.5, 0.2).into(),
-                specular: consts::linsrgb::white(),
+                specular: Specular {
+                    color: consts::linsrgb::white(),
+                    shiness: 10.0
+                }
             })
         })
         .push_triangles(&square(&[
@@ -423,11 +452,15 @@ fn main() {
             PositionUV { position: (0.5, 0.0, 0.5).into(), uv: (1.0, 0.0).into() },
             PositionUV { position: (0.5, 0.0, -0.5).into(), uv: (0.0, 1.0).into() }
         ]));
+
     world
         .push_object(Object {
             material: Rc::new(ColorMaterial {
                 diffuse: (0.5, 1.0, 0.2).into(),
-                specular: consts::linsrgb::white(),
+                specular: Specular {
+                    color: consts::linsrgb::white()/3.0,
+                    shiness: 10.0
+                }
             })
         })
         .push_sphere(&SphereGeometry{
@@ -436,15 +469,28 @@ fn main() {
         });
 
     world.push_light(Directional {
-        direction: Vector3::from((-1.0, -1.0, 0.0)).normalize(),
+        direction: Vector3::new(-1.0, -1.0, 0.0).normalize(),
         color: (1.0, 0.98, 0.95).into(),
-    }.into());
+    });
+
+    world.push_light(Spot {
+        origin: Point3::new(-0.5, 2.0, 0.5),
+        direction: Vector3::new(0.0, -1.0, 0.0),
+        angle: Deg(20.0).into(),
+        softness: 0.5,
+        color: LinSrgb::new(1.0, 0.0, 0.0)
+    });
+
+    world.push_light(Point {
+        origin: Point3::new(-0.5, 0.1, 0.5),
+        color: LinSrgb::new(0.0, 0.0, 1.0)
+    });
 
     let camera = Camera {
         fovy: Deg(60.0).into(),
         center: (2.0, 2.5, 2.0).into(),
-        toward: Vector3::from((-1.0, -1.0, -1.0)).normalize(),
-        up: Vector3::from((0.0, 1.0, 0.0)).normalize(),
+        toward: Vector3::new(-1.0, -1.0, -1.0).normalize(),
+        up: Vector3::new(0.0, 1.0, 0.0).normalize(),
         near: -0.1,
     };
 
@@ -454,44 +500,78 @@ fn main() {
         let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
 
         let ray = camera.shoot(&(clip_x, clip_y).into());
-        let hit = world.cast(ray, true);
+        let hit = world.cast(&ray);
 
         if hit.is_none() {
             continue;
         }
         let hit = hit.unwrap();
-        let material = &hit.object.material;
+        let material = hit.object.material.borrow();
         let normal = hit.at.normal;
 
+        let get_color = |to_view: Vector3<f32>, material: &Material, light: &Directional| {
+            let to_light = -light.direction;
+            let shadow_ray = Ray {
+                origin: hit.at.position,
+                direction: to_light,
+                exclude: hit.index.into(),
+                face_direction: FaceDirection::Both,
+            };
+            let in_shadow = world.cast(&shadow_ray).is_some();
+            if in_shadow {
+                return Option::None;
+            }
+            let correlation = to_light.dot(normal);
+            if correlation <= 0.0 {
+                return Option::None;
+            }
+            let diffuse_color = material.get_diffuse() * light.color * correlation;
+
+            let reflected_ray = 2.0 * correlation * normal - to_light;
+            let specular = material.get_specular();
+            let specular_amount = reflected_ray.dot(to_view).max(0.0);
+            let specular_color = (specular.color * light.color) * (specular_amount.powf(specular.shiness));
+            Option::Some(diffuse_color + specular_color)
+        };
         for light in &world.lights {
-            match light {
-                Light::Directional(light) => {
-                    let shadow_ray = Ray {
-                        origin: hit.at.position,
-                        direction: -light.direction,
-                        hint: hit.index.into(),
-                    };
-                    let in_shadow = world.cast(shadow_ray, true).is_some();
-                    if in_shadow {
-                        continue;
+            let some_color = match light {
+                Light::Directional(light) => get_color(-ray.direction, material, light),
+                Light::Spot(spot) => {
+                    let offset = hit.at.position - spot.origin;
+                    let angle = spot.direction.angle(offset).0.abs();
+                    let spot_spread = spot.angle.0;
+                    if angle > spot_spread {
+                        Option::None
+                    } else {
+                        let angular_attenuation = (1.0 - angle / spot_spread).powf(spot.softness + std::f32::EPSILON);
+                        let distance_attenuation = 1.0 / (offset.magnitude() + std::f32::EPSILON);
+                        get_color(-ray.direction, material, &Directional {
+                            direction: (hit.at.position - spot.origin).normalize(),
+                            color: spot.color * angular_attenuation * distance_attenuation,
+                        })
                     }
-                    let intensity = -light.direction.dot(normal);
-                    if intensity <= 0.0 {
-                        continue;
-                    }
-                    let diffuse = material.get_diffuse() * light.color * intensity;
-                    img[(x, y)].accumulate(diffuse);
                 },
+                Light::Point(point) => {
+                    let offset = hit.at.position - point.origin;
+                    let distance_attenuation = 1.0 / (offset.magnitude() + std::f32::EPSILON);
+                    get_color(-ray.direction, material, &Directional {
+                        direction: offset.normalize(),
+                        color: point.color * distance_attenuation,
+                    })
+                }
                 _ => {
                     unreachable!();
                 }
+            };
+            if let Option::Some(color) = some_color {
+                img[(x, y)] = img[(x, y)] + color;
             }
         }
 
-        if i % 10000 == 0 {
+        if i % 50000 == 0 {
             let i = i as i64;
             let elapsed = sw.elapsed_ms();
-            println!("{} rays in {} ms (avg: {} ray/s)", i, elapsed, i/elapsed * 1000);
+            println!("{} rays in {} ms (avg: {} ray/s)", i, elapsed, i/(elapsed+1) * 1000);
         }
     }
 
