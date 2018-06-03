@@ -1,3 +1,4 @@
+#[allow(dead_code)]
 pub mod linsrgb {
     use palette::{LinSrgb, Srgb};
 

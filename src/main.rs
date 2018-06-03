@@ -7,21 +7,24 @@ extern crate palette;
 extern crate png;
 extern crate stopwatch;
 
-use cgmath::{Angle, Rad, Deg,
-             EuclideanSpace, InnerSpace,
-             Point2, Point3, Vector2, Vector3, Matrix3};
-use image::Image;
-use palette::{LinSrgb, Srgb};
-use photon::PhotonAccumulator;
-use png::{Encoder, HasParameters};
+mod photon;
+mod image;
+mod lights;
+mod consts;
+
 use std::convert::{From, Into};
 use std::fs::File;
 use std::rc::Rc;
 use std::borrow::Borrow;
 
-mod photon;
-mod image;
-mod consts;
+use cgmath::{Angle, Deg,
+             EuclideanSpace, InnerSpace,
+             Point2, Point3, Vector2, Vector3, Matrix3};
+use image::Image;
+use palette::{LinSrgb, Srgb, IntoColor};
+use png::{Encoder, HasParameters};
+
+use lights::{Light, Directional, Spot, Point, ApproximateIntoDirectional };
 
 struct Camera {
     fovy: cgmath::Rad<f32>,
@@ -39,6 +42,7 @@ enum FaceDirection {
     Both
 }
 
+#[derive(Clone, Copy)]
 struct Ray {
     origin: Point3<f32>,
     direction: Vector3<f32>,
@@ -65,35 +69,65 @@ impl Camera {
     }
 }
 
-trait Material {
-    fn get_diffuse(&self) -> LinSrgb;
-    fn get_specular(&self) -> Specular;
+struct MaterialProbe
+{
+    at: PositionNormalUV,
+    view_direction: Vector3<f32>,
+    light_direction: Vector3<f32>,
+}
 
-    fn get_normal(&self) -> Vector3<f32>;
+trait Material {
+    fn adjust_normal(&self, at: PositionNormalUV) -> Vector3<f32>;
+
+    fn get_diffuse(&self, probe: &MaterialProbe) -> LinSrgb;
+    fn get_specular(&self, probe: &MaterialProbe) -> LinSrgb;
+    fn get_shiness(&self) -> f32;
+
+    fn get_refraction(&self, probe: &MaterialProbe) -> LinSrgb {
+        let shiness = self.get_shiness();
+        let diffuse = self.get_diffuse(&probe);
+        let specular = self.get_specular(&probe);
+
+        diffuse * (1.0 - shiness) + specular * shiness
+    }
 }
 
 struct ColorMaterial {
-    diffuse: LinSrgb,
-    specular: Specular,
-}
-
-#[derive(Clone, Copy)]
-struct Specular {
-    color: LinSrgb,
+    diffuse_color: LinSrgb,
     shiness: f32,
+    specular_color: LinSrgb,
+    smoothness: f32,
 }
 
 impl Material for ColorMaterial {
-    fn get_diffuse(&self) -> LinSrgb {
-        self.diffuse
+    fn adjust_normal(&self, at: PositionNormalUV) -> Vector3<f32> {
+        at.normal
     }
 
-    fn get_specular(&self) -> Specular {
-        self.specular
+    fn get_diffuse(&self, probe: &MaterialProbe) -> LinSrgb {
+        let cosine = probe.light_direction.dot(probe.at.normal);
+        if cosine > 0.0 {
+            self.diffuse_color * cosine
+        } else {
+            consts::linsrgb::black()
+        }
     }
 
-    fn get_normal(&self) -> Vector3<f32> {
-        -Vector3::unit_z()
+    fn get_specular(&self, probe: &MaterialProbe) -> LinSrgb {
+        let cosine = probe.light_direction.dot(probe.at.normal);
+        if cosine <= 0.0 {
+            return consts::linsrgb::black()
+        }
+        let reflected_ray = 2.0 * cosine * probe.at.normal - probe.light_direction;
+        let specular = 1.0/(self.smoothness + std::f32::EPSILON);
+        let energy_conserving = (specular + 8.0) / (8.0 * std::f32::consts::PI);
+        let specular_amount = reflected_ray.dot(probe.view_direction)
+            .max(0.0).powf(specular) * energy_conserving;
+        self.specular_color * specular_amount
+    }
+
+    fn get_shiness(&self) -> f32 {
+        self.shiness
     }
 }
 
@@ -193,42 +227,6 @@ impl HasPosition for PositionNormalUV {
     }
 }
 
-struct Directional {
-    direction: Vector3<f32>,
-    color: LinSrgb,
-}
-
-struct Spot {
-    origin: Point3<f32>,
-    direction: Vector3<f32>,
-    angle: Rad<f32>,
-    softness: f32,
-    color: LinSrgb,
-}
-
-struct Point {
-    origin: Point3<f32>,
-    color: LinSrgb,
-}
-
-enum Light {
-    Directional(Directional),
-    Spot(Spot),
-    Point(Point),
-}
-
-impl std::convert::From<Directional> for Light {
-    fn from(x: Directional) -> Light { Light::Directional(x) }
-}
-
-impl std::convert::From<Spot> for Light {
-    fn from(x: Spot) -> Light { Light::Spot(x) }
-}
-
-impl std::convert::From<Point> for Light {
-    fn from(x: Point) -> Light { Light::Point(x) }
-}
-
 #[derive(Default)]
 struct World {
     objects: Vec<Object>,
@@ -240,6 +238,7 @@ struct World {
 
 struct Hit<'a> {
     object: &'a Object,
+    ray: Ray,
     index: PrimitiveIndex,
     at: PositionNormalUV,
 }
@@ -331,6 +330,7 @@ impl World {
             some_nearest_t = t.into();
             some_nearest_result = Hit {
                 object: &self.objects[triangle.object_index.0],
+                ray: *ray,
                 index: PrimitiveIndex::Triangle(i),
                 at: PositionNormalUV { position, normal, uv }
             }.into();
@@ -376,11 +376,56 @@ impl World {
             some_nearest_t = t.into();
             some_nearest_result = Hit {
                 object: &self.objects[sphere.object_index.0],
+                ray: *ray,
                 index: PrimitiveIndex::Sphere(i),
                 at: PositionNormalUV { position, normal, uv }
             }.into();
         }
         some_nearest_result
+    }
+
+    fn get_refraction(&self, hit: &Hit) -> LinSrgb {
+        let material: &Material = hit.object.material.borrow();
+        let ray = hit.ray;
+        let normal = material.adjust_normal(hit.at);
+
+        let mut sum = LinSrgb::new(0.0, 0.0, 0.0);
+        for light in &self.lights {
+            let approx_directional = light.approximate_into_directional(hit.at.position);
+            if approx_directional.is_none() {
+                continue;
+            }
+            let light = approx_directional.unwrap();
+
+            let cosine = -light.direction.dot(normal);
+            if cosine <= 0.0 {
+                continue;
+            }
+
+            let shadow_ray = Ray {
+                origin: hit.at.position,
+                direction: -light.direction,
+                exclude: hit.index.into(),
+                face_direction: FaceDirection::Both,
+            };
+            let in_shadow = self.cast(&shadow_ray).is_some();
+            if in_shadow {
+                continue;
+            }
+
+            let probe = MaterialProbe {
+                at: PositionNormalUV { position: hit.at.position, normal: normal, uv: hit.at.uv },
+                view_direction: -ray.direction,
+                light_direction: -light.direction,
+            };
+            // to_light, normal
+            let shiness = material.get_shiness();
+            let diffuse = material.get_diffuse(&probe) * light.color;
+            let specular = material.get_specular(&probe) * light.color;
+
+            sum = sum + diffuse * (1.0 - shiness) + specular * shiness;
+        }
+        sum
     }
 }
 
@@ -432,6 +477,17 @@ fn square(vertices: &[PositionUV; 4]) -> [[PositionNormalUV; 3]; 2] {
     ]
 }
 
+fn post_process(img: &mut Image<LinSrgb>) {
+    let mut luma: Vec<f32> = img.as_slice().iter().cloned()
+        .map(|x| x.into_luma().luma)
+        .collect();
+    luma.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p98 = luma[(luma.len() as f32 * 0.98) as usize];
+    for pixel in img.as_slice_mut() {
+        *pixel = *pixel / p98;
+    }
+}
+
 fn main() {
     let mut img = Image::<LinSrgb>::new(640, 480);
 
@@ -439,11 +495,10 @@ fn main() {
     world
         .push_object(Object {
             material: Rc::new(ColorMaterial {
-                diffuse: (1.0, 0.5, 0.2).into(),
-                specular: Specular {
-                    color: consts::linsrgb::white(),
-                    shiness: 10.0
-                }
+                diffuse_color: (1.0, 0.5, 0.2).into(),
+                shiness: 0.5,
+                specular_color: consts::linsrgb::white(),
+                smoothness: 1.0,
             })
         })
         .push_triangles(&square(&[
@@ -456,11 +511,10 @@ fn main() {
     world
         .push_object(Object {
             material: Rc::new(ColorMaterial {
-                diffuse: (0.5, 1.0, 0.2).into(),
-                specular: Specular {
-                    color: consts::linsrgb::white()/3.0,
-                    shiness: 10.0
-                }
+                diffuse_color: (0.5, 1.0, 0.2).into(),
+                shiness: 0.5,
+                specular_color: consts::linsrgb::white(),
+                smoothness: 0.001,
             })
         })
         .push_sphere(&SphereGeometry{
@@ -470,7 +524,7 @@ fn main() {
 
     world.push_light(Directional {
         direction: Vector3::new(-1.0, -1.0, 0.0).normalize(),
-        color: (1.0, 0.98, 0.95).into(),
+        color: LinSrgb::new(1.0, 0.98, 0.95),
     });
 
     world.push_light(Spot {
@@ -500,73 +554,12 @@ fn main() {
         let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
 
         let ray = camera.shoot(&(clip_x, clip_y).into());
-        let hit = world.cast(&ray);
+        let some_hit = world.cast(&ray);
+        let refraction = some_hit
+            .map(|hit| world.get_refraction(&hit))
+            .unwrap_or(LinSrgb::new(0.0, 0.0, 0.0));
 
-        if hit.is_none() {
-            continue;
-        }
-        let hit = hit.unwrap();
-        let material = hit.object.material.borrow();
-        let normal = hit.at.normal;
-
-        let get_color = |to_view: Vector3<f32>, material: &Material, light: &Directional| {
-            let to_light = -light.direction;
-            let shadow_ray = Ray {
-                origin: hit.at.position,
-                direction: to_light,
-                exclude: hit.index.into(),
-                face_direction: FaceDirection::Both,
-            };
-            let in_shadow = world.cast(&shadow_ray).is_some();
-            if in_shadow {
-                return Option::None;
-            }
-            let correlation = to_light.dot(normal);
-            if correlation <= 0.0 {
-                return Option::None;
-            }
-            let diffuse_color = material.get_diffuse() * light.color * correlation;
-
-            let reflected_ray = 2.0 * correlation * normal - to_light;
-            let specular = material.get_specular();
-            let specular_amount = reflected_ray.dot(to_view).max(0.0);
-            let specular_color = (specular.color * light.color) * (specular_amount.powf(specular.shiness));
-            Option::Some(diffuse_color + specular_color)
-        };
-        for light in &world.lights {
-            let some_color = match light {
-                Light::Directional(light) => get_color(-ray.direction, material, light),
-                Light::Spot(spot) => {
-                    let offset = hit.at.position - spot.origin;
-                    let angle = spot.direction.angle(offset).0.abs();
-                    let spot_spread = spot.angle.0;
-                    if angle > spot_spread {
-                        Option::None
-                    } else {
-                        let angular_attenuation = (1.0 - angle / spot_spread).powf(spot.softness + std::f32::EPSILON);
-                        let distance_attenuation = 1.0 / (offset.magnitude() + std::f32::EPSILON);
-                        get_color(-ray.direction, material, &Directional {
-                            direction: (hit.at.position - spot.origin).normalize(),
-                            color: spot.color * angular_attenuation * distance_attenuation,
-                        })
-                    }
-                },
-                Light::Point(point) => {
-                    let offset = hit.at.position - point.origin;
-                    let distance_attenuation = 1.0 / (offset.magnitude() + std::f32::EPSILON);
-                    get_color(-ray.direction, material, &Directional {
-                        direction: offset.normalize(),
-                        color: point.color * distance_attenuation,
-                    })
-                }
-                _ => {
-                    unreachable!();
-                }
-            };
-            if let Option::Some(color) = some_color {
-                img[(x, y)] = img[(x, y)] + color;
-            }
-        }
+        img[(x, y)] = img[(x, y)] + refraction;
 
         if i % 50000 == 0 {
             let i = i as i64;
@@ -574,7 +567,7 @@ fn main() {
             println!("{} rays in {} ms (avg: {} ray/s)", i, elapsed, i/(elapsed+1) * 1000);
         }
     }
-
+    post_process(&mut img);
     {
         let encoded = Image::<Srgb<u8>>::convert_from(&img);
         let out_file = File::create("./out.png").unwrap();
