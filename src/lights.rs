@@ -1,11 +1,11 @@
 use std;
 use std::convert::{From};
-use cgmath::{Angle, Rad,
-             Point3, Vector3, InnerSpace};
+use cgmath::{Rad, Point3, Vector3, InnerSpace};
 use palette::{LinSrgb};
 
 #[derive(Clone)]
 pub struct Directional {
+    pub origin: Option<Point3<f32>>,
     pub direction: Vector3<f32>,
     pub color: LinSrgb,
 }
@@ -46,7 +46,7 @@ pub trait ApproximateIntoDirectional {
 }
 
 impl ApproximateIntoDirectional for Directional {
-    fn approximate_into_directional(&self, position: Point3<f32>) -> Option<Directional> {
+    fn approximate_into_directional(&self, _position: Point3<f32>) -> Option<Directional> {
         Option::Some(self.clone())
     }
 }
@@ -63,6 +63,7 @@ impl ApproximateIntoDirectional for Spot {
         let angular_attenuation = (1.0 - angle / spot_spread).powf(self.softness + std::f32::EPSILON);
         let distance_attenuation = 1.0 / (offset.magnitude() + std::f32::EPSILON);
         return Option::Some(Directional {
+            origin: Option::Some(self.origin),
             direction: (position - self.origin).normalize(),
             color: self.color * angular_attenuation * distance_attenuation,
         });
@@ -74,6 +75,7 @@ impl ApproximateIntoDirectional for Point {
         let offset = position - self.origin;
         let distance_attenuation = 1.0 / (offset.magnitude() + std::f32::EPSILON);
         Option::Some(Directional {
+            origin: Option::Some(self.origin),
             direction: offset.normalize(),
             color: self.color * distance_attenuation,
         })

@@ -1,9 +1,10 @@
-use palette::{Component, IntoColor, Pixel};
+use palette::{Component, IntoColor, FromColor, Pixel};
 use palette::rgb::{Rgb, RgbSpace, RgbStandard};
 use std::iter;
 use std::ops::{Index, IndexMut};
 use std::vec::Vec;
 
+#[derive(Clone)]
 pub struct Image<P> {
     pub width: usize,
     pub height: usize,
@@ -60,6 +61,19 @@ where
             height: img.height,
             pixels: img.pixels.iter().cloned()
                 .map(|x| x.into_rgb().into_encoding().into_format())
+                .collect()
+        }
+    }
+
+    pub fn convert_into<Q>(&self) -> Image<Q>
+    where
+        Q: Clone + FromColor<<S::Space as RgbSpace>::WhitePoint, f32>
+    {
+        Image {
+            width: self.width,
+            height: self.height,
+            pixels: self.pixels.iter().cloned()
+                .map(|x| Q::from_rgb(x.into_format::<f32>().into_linear()))
                 .collect()
         }
     }

@@ -10,6 +10,9 @@ extern crate stopwatch;
 mod photon;
 mod image;
 mod lights;
+mod materials;
+mod geometric;
+mod primitives;
 mod consts;
 
 use std::convert::{From, Into};
@@ -18,13 +21,16 @@ use std::rc::Rc;
 use std::borrow::Borrow;
 
 use cgmath::{Angle, Deg,
-             EuclideanSpace, InnerSpace,
+             EuclideanSpace, InnerSpace, MetricSpace,
              Point2, Point3, Vector2, Vector3, Matrix3};
-use image::Image;
 use palette::{LinSrgb, Srgb, IntoColor};
 use png::{Encoder, HasParameters};
 
 use lights::{Light, Directional, Spot, Point, ApproximateIntoDirectional };
+use materials::{MaterialProbe, Material, ColorMaterial};
+use primitives::{PrimitiveIndex, Object, Triangle, Sphere, ObjectIndex, SphereGeometry};
+use geometric::{PositionNormalUV, PositionUV};
+use image::Image;
 
 struct Camera {
     fovy: cgmath::Rad<f32>,
@@ -66,164 +72,6 @@ impl Camera {
             exclude: Option::None,
             face_direction: FaceDirection::Front,
         }
-    }
-}
-
-struct MaterialProbe
-{
-    at: PositionNormalUV,
-    view_direction: Vector3<f32>,
-    light_direction: Vector3<f32>,
-}
-
-trait Material {
-    fn adjust_normal(&self, at: PositionNormalUV) -> Vector3<f32>;
-
-    fn get_diffuse(&self, probe: &MaterialProbe) -> LinSrgb;
-    fn get_specular(&self, probe: &MaterialProbe) -> LinSrgb;
-    fn get_shiness(&self) -> f32;
-
-    fn get_refraction(&self, probe: &MaterialProbe) -> LinSrgb {
-        let shiness = self.get_shiness();
-        let diffuse = self.get_diffuse(&probe);
-        let specular = self.get_specular(&probe);
-
-        diffuse * (1.0 - shiness) + specular * shiness
-    }
-}
-
-struct ColorMaterial {
-    diffuse_color: LinSrgb,
-    shiness: f32,
-    specular_color: LinSrgb,
-    smoothness: f32,
-}
-
-impl Material for ColorMaterial {
-    fn adjust_normal(&self, at: PositionNormalUV) -> Vector3<f32> {
-        at.normal
-    }
-
-    fn get_diffuse(&self, probe: &MaterialProbe) -> LinSrgb {
-        let cosine = probe.light_direction.dot(probe.at.normal);
-        if cosine > 0.0 {
-            self.diffuse_color * cosine
-        } else {
-            consts::linsrgb::black()
-        }
-    }
-
-    fn get_specular(&self, probe: &MaterialProbe) -> LinSrgb {
-        let cosine = probe.light_direction.dot(probe.at.normal);
-        if cosine <= 0.0 {
-            return consts::linsrgb::black()
-        }
-        let reflected_ray = 2.0 * cosine * probe.at.normal - probe.light_direction;
-        let specular = 1.0/(self.smoothness + std::f32::EPSILON);
-        let energy_conserving = (specular + 8.0) / (8.0 * std::f32::consts::PI);
-        let specular_amount = reflected_ray.dot(probe.view_direction)
-            .max(0.0).powf(specular) * energy_conserving;
-        self.specular_color * specular_amount
-    }
-
-    fn get_shiness(&self) -> f32 {
-        self.shiness
-    }
-}
-
-struct Object {
-    material: Rc<Material>,
-}
-
-#[derive(PartialEq, Eq, Clone, Copy)]
-struct ObjectIndex(usize);
-
-struct Sphere {
-    object_index: ObjectIndex,
-    geometry: SphereGeometry,
-}
-
-#[derive(Clone, Copy)]
-struct SphereGeometry {
-    center: cgmath::Point3<f32>,
-    radius: f32,
-}
-
-struct Triangle<T> {
-    object_index: ObjectIndex,
-    vertices: [T; 3],
-}
-
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum PrimitiveIndex {
-    Sphere(usize), Triangle(usize)
-}
-
-impl<T: HasPosition> Triangle<T> {
-    fn face_normal(&self) -> Vector3<f32> {
-        let a = self.vertices[1].get_position() - self.vertices[0].get_position();
-        let b = self.vertices[2].get_position() - self.vertices[1].get_position();
-
-        a.cross(b).normalize()
-    }
-
-    fn backface(&self, ray_dir: &Vector3<f32>) -> bool {
-        self.face_normal().dot(*ray_dir) > 0.0
-    }
-}
-
-#[derive(PartialEq, Eq, Clone, Copy)]
-struct VertexIndex(usize);
-
-trait HasPosition {
-    fn get_position(&self) -> Point3<f32>;
-}
-
-#[derive(Clone, Copy)]
-struct Position {
-    position: Point3<f32>,
-}
-
-impl HasPosition for Position {
-    fn get_position(&self) -> Point3<f32> {
-        self.position
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PositionNormal {
-    position: Point3<f32>,
-    normal: Vector3<f32>,
-}
-
-impl HasPosition for PositionNormal {
-    fn get_position(&self) -> Point3<f32> {
-        self.position
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PositionUV {
-    position: Point3<f32>,
-    uv: Point2<f32>,
-}
-
-impl HasPosition for PositionUV {
-    fn get_position(&self) -> Point3<f32> {
-        self.position
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PositionNormalUV {
-    position: Point3<f32>,
-    normal: Vector3<f32>,
-    uv: Point2<f32>,
-}
-
-impl HasPosition for PositionNormalUV {
-    fn get_position(&self) -> Point3<f32> {
-        self.position
     }
 }
 
@@ -408,9 +256,20 @@ impl World {
                 exclude: hit.index.into(),
                 face_direction: FaceDirection::Both,
             };
-            let in_shadow = self.cast(&shadow_ray).is_some();
-            if in_shadow {
-                continue;
+
+            if let Option::Some(occlusion) = self.cast(&shadow_ray) {
+                match light.origin {
+                    Option::Some(light_origin) => {
+                        let occlusion_distance = hit.at.position.distance(occlusion.at.position);
+                        let light_distance = hit.at.position.distance(light_origin);
+                        if occlusion_distance < light_distance {
+                            continue;
+                        }
+                    },
+                    Option::None => {
+                        continue;
+                    }
+                }
             }
 
             let probe = MaterialProbe {
@@ -418,11 +277,11 @@ impl World {
                 view_direction: -ray.direction,
                 light_direction: -light.direction,
             };
+
             // to_light, normal
             let shiness = material.get_shiness();
             let diffuse = material.get_diffuse(&probe) * light.color;
             let specular = material.get_specular(&probe) * light.color;
-
             sum = sum + diffuse * (1.0 - shiness) + specular * shiness;
         }
         sum
@@ -478,14 +337,18 @@ fn square(vertices: &[PositionUV; 4]) -> [[PositionNormalUV; 3]; 2] {
 }
 
 fn post_process(img: &mut Image<LinSrgb>) {
-    let mut luma: Vec<f32> = img.as_slice().iter().cloned()
+    let mut luma_cumulative: Vec<f32> = img.as_slice().iter().cloned()
         .map(|x| x.into_luma().luma)
         .collect();
-    luma.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p98 = luma[(luma.len() as f32 * 0.98) as usize];
-    for pixel in img.as_slice_mut() {
-        *pixel = *pixel / p98;
+    luma_cumulative.sort_by(|a, b| (*a).partial_cmp(b).unwrap());
+    let p98 = luma_cumulative[(luma_cumulative.len() as f32 * 0.99) as usize];
+    if p98 > std::f32::EPSILON {
+        for pixel in img.as_slice_mut() {
+            *pixel = *pixel / p98;
+        }
     }
+
+    // TODO: highlight bloom effect
 }
 
 fn main() {
@@ -502,10 +365,10 @@ fn main() {
             })
         })
         .push_triangles(&square(&[
-            PositionUV { position: (-0.5, 0.0, -0.5).into(), uv: (0.0, 0.0).into() },
-            PositionUV { position: (-0.5, 0.0, 0.5).into(), uv: (0.0, 1.0).into() },
-            PositionUV { position: (0.5, 0.0, 0.5).into(), uv: (1.0, 0.0).into() },
-            PositionUV { position: (0.5, 0.0, -0.5).into(), uv: (0.0, 1.0).into() }
+            PositionUV { position: (-2.0, 0.0, -2.0).into(), uv: (0.0, 0.0).into() },
+            PositionUV { position: (-2.0, 0.0, 2.0).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (2.0, 0.0, 2.0).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (2.0, 0.0, -2.0).into(), uv: (0.0, 1.0).into() }
         ]));
 
     world
@@ -514,7 +377,7 @@ fn main() {
                 diffuse_color: (0.5, 1.0, 0.2).into(),
                 shiness: 0.5,
                 specular_color: consts::linsrgb::white(),
-                smoothness: 0.001,
+                smoothness: 0.01,
             })
         })
         .push_sphere(&SphereGeometry{
@@ -523,16 +386,17 @@ fn main() {
         });
 
     world.push_light(Directional {
+        origin: Option::None,
         direction: Vector3::new(-1.0, -1.0, 0.0).normalize(),
         color: LinSrgb::new(1.0, 0.98, 0.95),
     });
 
     world.push_light(Spot {
-        origin: Point3::new(-0.5, 2.0, 0.5),
+        origin: Point3::new(-0.0, 3.0, 0.0),
         direction: Vector3::new(0.0, -1.0, 0.0),
-        angle: Deg(20.0).into(),
-        softness: 0.5,
-        color: LinSrgb::new(1.0, 0.0, 0.0)
+        angle: Deg(30.0).into(),
+        softness: 1.0,
+        color: LinSrgb::new(1.0, 0.0, 0.0) * 2.0f32
     });
 
     world.push_light(Point {
