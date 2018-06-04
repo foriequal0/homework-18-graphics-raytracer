@@ -23,7 +23,7 @@ use std::borrow::Borrow;
 use cgmath::{Angle, Deg,
              EuclideanSpace, InnerSpace, MetricSpace,
              Point2, Point3, Vector2, Vector3, Matrix3};
-use palette::{LinSrgb, Srgb, IntoColor};
+use palette::{LinSrgb, Srgb, IntoColor, Mix};
 use png::{Encoder, HasParameters};
 
 use lights::{Light, Directional, Spot, Point, ApproximateIntoDirectional };
@@ -48,11 +48,27 @@ enum FaceDirection {
     Both
 }
 
+impl FaceDirection {
+    fn invert(self) -> FaceDirection {
+        match self {
+            FaceDirection::Front => FaceDirection::Back,
+            FaceDirection::Back => FaceDirection::Front,
+            FaceDirection::Both => FaceDirection::Both,
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Ray {
     origin: Point3<f32>,
     direction: Vector3<f32>,
-    exclude: Option<PrimitiveIndex>,
+    face_direction: FaceDirection,
+    exclude: Option<Exclusion>,
+}
+
+#[derive(Clone, Copy)]
+struct Exclusion {
+    index: PrimitiveIndex,
     face_direction: FaceDirection,
 }
 
@@ -89,6 +105,19 @@ struct Hit<'a> {
     ray: Ray,
     index: PrimitiveIndex,
     at: PositionNormalUV,
+    face_direction: FaceDirection,
+    distance: f32,
+}
+
+enum Refraction {
+    Escaped {
+        travel_distance: f32,
+        escape_ray: Ray,
+    },
+    Infinite {
+        ray: Ray,
+    },
+    Trapped
 }
 
 impl World {
@@ -112,30 +141,36 @@ impl World {
     }
 
     fn cast(&self, ray: &Ray) -> Option<Hit> {
-        let mut some_nearest_t = Option::None;
-        let mut some_nearest_result = Option::None;
+        let mut nearest_distance = Option::None;
+        let mut nearest_result = Option::None;
         for (i, triangle) in self.triangles.iter().enumerate() {
-            if ray.exclude == PrimitiveIndex::Triangle(i).into() {
-                // cast가 시작한 객체랑 같음
+            let backface = triangle.backface(&ray.direction);
+            if backface && ray.face_direction == FaceDirection::Front
+                || !backface && ray.face_direction == FaceDirection::Back {
                 continue;
             }
 
-            let backface = triangle.backface(&ray.direction);
-            if (ray.face_direction == FaceDirection::Front && backface)
-                || (ray.face_direction == FaceDirection::Back && !backface)
-            {
-                // 뒤집어짐
-                continue;
+            if let Option::Some(exclusion) = ray.exclude {
+                let same_face = exclusion.index == PrimitiveIndex::Triangle(i);
+                let criteria = match exclusion.face_direction {
+                    FaceDirection::Front => !backface,
+                    FaceDirection::Back => backface,
+                    FaceDirection::Both => true
+                };
+                if same_face && criteria {
+                    continue;
+                }
             }
+
             let face_normal = triangle.face_normal();
             let d = face_normal.dot(triangle.vertices[0].position.to_vec());
-            let t = (d - face_normal.dot(ray.origin.to_vec())) / face_normal.dot(ray.direction);
-            if t <= 0.0 {
+            let travel_distance = (d - face_normal.dot(ray.origin.to_vec())) / face_normal.dot(ray.direction);
+            if travel_distance <= 0.0 {
                 // 광선 진행방향 뒷편에 존재함
                 continue;
             }
 
-            let position = ray.origin + ray.direction * t;
+            let position = ray.origin + ray.direction * travel_distance;
 
             let v = [
                 triangle.vertices[0].position,
@@ -154,8 +189,8 @@ impl World {
                 continue;
             }
 
-            if let Option::Some(nearest_t) = some_nearest_t {
-                if nearest_t < t {
+            if let Option::Some(nearest_t) = nearest_distance {
+                if nearest_t < travel_distance {
                     continue;
                 }
             }
@@ -173,66 +208,168 @@ impl World {
                 triangle.vertices[2].uv.to_vec()
             ];
 
-            let normal = normals * barycentric;
+            let normal = {
+                let mut tmp = normals * barycentric;
+                if backface { -tmp } else { tmp }
+            };
             let uv = Point2::from_vec(uvs[0] * barycentric[0] + uvs[1] * barycentric[1] + uvs[2] * barycentric[2]);
-            some_nearest_t = t.into();
-            some_nearest_result = Hit {
+            nearest_distance = travel_distance.into();
+            nearest_result = Hit {
                 object: &self.objects[triangle.object_index.0],
                 ray: *ray,
                 index: PrimitiveIndex::Triangle(i),
-                at: PositionNormalUV { position, normal, uv }
+                at: PositionNormalUV { position, normal, uv },
+                distance: travel_distance,
+                face_direction: if backface { FaceDirection::Back } else { FaceDirection::Front }
             }.into();
         }
 
         for (i, sphere) in self.spheres.iter().enumerate() {
-            if ray.exclude == PrimitiveIndex::Sphere(i).into() {
-                // cast가 시작한 객체랑 같음
-                continue;
-            }
-
-            let distance = (sphere.geometry.center - ray.origin).cross(ray.direction).magnitude();
-            if distance > sphere.geometry.radius {
+            let line_sphere_distance = (sphere.geometry.center - ray.origin).cross(ray.direction).magnitude();
+            if line_sphere_distance > sphere.geometry.radius {
                 continue
             }
 
             let displacement = sphere.geometry.center - ray.origin;
             let tc = ray.direction.dot(displacement);
-            if tc < 0.0 {
+            let k = (sphere.geometry.radius.powi(2) - line_sphere_distance.powi(2)).sqrt();
+            let (travel_distance, backface) = match ray.face_direction{
+                FaceDirection::Front => (tc - k, false),
+                FaceDirection::Back => (tc + k, true),
+                FaceDirection::Both => if tc < k {
+                    (tc + k, true)
+                } else {
+                    (tc - k, false)
+                }
+            };
+            if travel_distance <= 0.0 {
                 continue;
             }
 
-            let k = (sphere.geometry.radius.powi(2) - distance.powi(2)).sqrt();
-            let t = match ray.face_direction{
-                FaceDirection::Front => tc - k,
-                FaceDirection::Back => tc + k,
-                FaceDirection::Both => if tc > k { tc - k } else {tc + k}
-            };
-
-            if let Option::Some(nearest_t) = some_nearest_t {
-                if nearest_t < t {
+            if let Option::Some(exclusion) = ray.exclude {
+                let same_face = exclusion.index == PrimitiveIndex::Sphere(i);
+                let criteria = match exclusion.face_direction {
+                    FaceDirection::Front => !backface,
+                    FaceDirection::Back => backface,
+                    FaceDirection::Both => true
+                };
+                if same_face && criteria {
                     continue;
                 }
             }
 
-            let position = ray.origin + ray.direction * t;
-            let normal = (position - sphere.geometry.center).normalize();
+            if let Option::Some(nearest_t) = nearest_distance {
+                if nearest_t < travel_distance {
+                    continue;
+                }
+            }
+
+            let position = ray.origin + ray.direction * travel_distance;
+            let normal = {
+                let tmp = (position - sphere.geometry.center).normalize();
+                if backface { -tmp } else { tmp }
+            };
+
             let uv = Point2 {
                 x: normal.y.acos() / std::f32::consts::PI,
                 y: normal.z.atan2(normal.x) / (std::f32::consts::PI * 2.0) + 0.5,
             };
 
-            some_nearest_t = t.into();
-            some_nearest_result = Hit {
+            nearest_distance = travel_distance.into();
+            nearest_result = Hit {
                 object: &self.objects[sphere.object_index.0],
                 ray: *ray,
                 index: PrimitiveIndex::Sphere(i),
-                at: PositionNormalUV { position, normal, uv }
+                at: PositionNormalUV { position, normal, uv },
+                distance: travel_distance,
+                face_direction: if backface { FaceDirection::Back } else { FaceDirection::Front }
             }.into();
         }
-        some_nearest_result
+        nearest_result
     }
 
-    fn get_refraction(&self, hit: &Hit) -> LinSrgb {
+    fn get_reflect(&self, hit: &Hit) -> Ray {
+        let reflect = |n: Vector3<f32>, l: Vector3<f32>| l - 2.0 * l.dot(n) * n;
+        let reflected = reflect(hit.at.normal, hit.ray.direction);
+        let ray = Ray {
+            origin: hit.at.position,
+            direction: reflected.normalize(),
+            face_direction: hit.ray.face_direction,
+            exclude: Exclusion {
+                index: hit.index,
+                face_direction: hit.face_direction.invert(),
+            }.into(),
+        };
+        ray
+    }
+
+    fn get_refract<'a>(&self, hit: &'a Hit, max_distance: f32) -> Refraction {
+        let refract = |n: Vector3<f32>, l: Vector3<f32>, k: f32| {
+            let cos = -l.dot(n);
+            if k.powi(2) >= 1.0 - cos.powi(2) {
+                Option::Some((l + n * cos) / k - n * (1.0 - (1.0 - cos.powi(2)) / k.powi(2)).sqrt())
+                    .map(|x| x.normalize())
+            } else {
+                Option::None
+            }
+        };
+
+        let k = hit.object.material.get_refraction_index();
+        let refract_in = refract(hit.at.normal, hit.ray.direction, k)
+            .expect("Refraction index must larger than 1.0, then it'll never fail");
+        let ray_inside = Ray {
+            origin: hit.at.position,
+            direction: refract_in.normalize(),
+            face_direction: FaceDirection::Back,
+            exclude: Exclusion {
+                index: hit.index,
+                face_direction: FaceDirection::Front,
+            }.into()
+        };
+
+        if hit.index == PrimitiveIndex::Sphere(1) {
+            let x = hit.ray.direction.normalize();
+            let y = refract_in.normalize();
+            let z = 1.0;
+        }
+        // get out
+        let mut hit_inside = match self.cast(&ray_inside) {
+            Option::Some(hit) => hit,
+            Option::None => { return Refraction::Infinite { ray: ray_inside }; }
+        };
+        let mut travel_distance = hit_inside.at.position.distance(hit.at.position);
+        let mut refract_out = refract(hit_inside.at.normal, hit_inside.ray.direction, 1.0/k);
+        let mut retry = 0;
+        while refract_out.is_none() && travel_distance <= max_distance && retry < 10 {
+            let previous_hit_position = hit_inside.at.position;
+            let total_reflect = self.get_reflect(&hit_inside);
+            hit_inside = match self.cast(&total_reflect) {
+                Option::Some(hit) => hit,
+                Option::None => { return Refraction::Infinite { ray: total_reflect }; }
+            };
+            travel_distance += previous_hit_position.distance(hit_inside.at.position);
+            refract_out = refract(hit_inside.at.normal, hit_inside.ray.direction, 1.0/k);
+            retry += 1;
+        }
+
+        match refract_out {
+            Option::None => Refraction::Trapped,
+            Option::Some(out) => {
+                let escape_ray = Ray {
+                    origin: hit_inside.at.position,
+                    direction: out.normalize(),
+                    face_direction: FaceDirection::Front,
+                    exclude: Exclusion {
+                        index: hit_inside.index,
+                        face_direction: FaceDirection::Back,
+                    }.into()
+                };
+                Refraction::Escaped { travel_distance, escape_ray }
+            }
+        }
+    }
+
+    fn get_shade(&self, hit: &Hit) -> LinSrgb {
         let material: &Material = hit.object.material.borrow();
         let ray = hit.ray;
         let normal = material.adjust_normal(hit.at);
@@ -250,11 +387,15 @@ impl World {
                 continue;
             }
 
+            // TODO: shadow ray through transparent object
             let shadow_ray = Ray {
                 origin: hit.at.position,
                 direction: -light.direction,
-                exclude: hit.index.into(),
                 face_direction: FaceDirection::Both,
+                exclude: Exclusion {
+                    index: hit.index,
+                    face_direction: FaceDirection::Both,
+                }.into()
             };
 
             if let Option::Some(occlusion) = self.cast(&shadow_ray) {
@@ -358,10 +499,13 @@ fn main() {
     world
         .push_object(Object {
             material: Rc::new(ColorMaterial {
-                diffuse_color: (1.0, 0.5, 0.2).into(),
+                diffuse_color: (1.0, 0.8, 0.6).into(),
                 shiness: 0.5,
                 specular_color: consts::linsrgb::white(),
                 smoothness: 1.0,
+                refraction_index: 1.0,
+                opaque_decay: 0.0,
+                transparency: 0.0,
             })
         })
         .push_triangles(&square(&[
@@ -371,6 +515,58 @@ fn main() {
             PositionUV { position: (2.0, 0.0, -2.0).into(), uv: (0.0, 1.0).into() }
         ]));
 
+    // 빨간공
+    world
+        .push_object(Object {
+            material: Rc::new(ColorMaterial {
+                diffuse_color: (1.0, 0.2, 0.2).into(),
+                shiness: 0.2,
+                specular_color: consts::linsrgb::yellow(),
+                smoothness: 0.2,
+                refraction_index: 1.0,
+                opaque_decay: 0.0,
+                transparency: 0.0,
+            })
+        })
+        .push_sphere(&SphereGeometry{
+            center: (-0.5, 0.5, 0.5 / 3.0f32.sqrt()).into(),
+            radius: 0.5,
+        });
+
+    world
+        .push_object(Object{
+            material: Rc::new(ColorMaterial {
+                diffuse_color: (1.0, 1.0, 1.0).into(),
+                shiness: 1.0,
+                specular_color: consts::linsrgb::white(),
+                smoothness: 0.01,
+                refraction_index: 1.12,
+                opaque_decay: 0.3,
+                transparency: 0.96,
+            })
+        })
+        .push_sphere(&SphereGeometry{
+            center: (0.5, 0.5, 0.5 / 3.0f32.sqrt()).into(),
+            radius: 0.5,
+        });
+
+    world
+        .push_object(Object {
+            material: Rc::new(ColorMaterial {
+                diffuse_color: (0.2, 0.5, 1.0).into(),
+                shiness: 0.9,
+                specular_color: consts::linsrgb::blue(),
+                smoothness: 0.7,
+                refraction_index: 1.0,
+                opaque_decay: 0.0,
+                transparency: 0.0,
+            })
+        })
+        .push_sphere(&SphereGeometry{
+            center: (0.0, 0.5, -1.0 / 3.0f32.sqrt()).into(),
+            radius: 0.5,
+        });
+
     world
         .push_object(Object {
             material: Rc::new(ColorMaterial {
@@ -378,10 +574,13 @@ fn main() {
                 shiness: 0.5,
                 specular_color: consts::linsrgb::white(),
                 smoothness: 0.01,
+                refraction_index: 1.0,
+                opaque_decay: 0.0,
+                transparency: 0.0,
             })
         })
         .push_sphere(&SphereGeometry{
-            center: (0.0, 0.5, 0.0).into(),
+            center: (0.0, 0.5 + (2.0f32/3.0).sqrt(), 0.0).into(),
             radius: 0.5,
         });
 
@@ -392,16 +591,16 @@ fn main() {
     });
 
     world.push_light(Spot {
-        origin: Point3::new(-0.0, 3.0, 0.0),
-        direction: Vector3::new(0.0, -1.0, 0.0),
-        angle: Deg(30.0).into(),
+        origin: Point3::new(0.0, 10.0, 0.0),
+        direction: Vector3::new(0.0, -1.0, -0.0).normalize(),
+        angle: Deg(60.0).into(),
         softness: 1.0,
-        color: LinSrgb::new(1.0, 0.0, 0.0) * 2.0f32
+        color: LinSrgb::new(1.0, 0.5, 0.9) * 1.0f32
     });
 
     world.push_light(Point {
-        origin: Point3::new(-0.5, 0.1, 0.5),
-        color: LinSrgb::new(0.0, 0.0, 1.0)
+        origin: Point3::new(0.0, 0.1, 0.0),
+        color: LinSrgb::new(0.8, 0.8, 1.0)
     });
 
     let camera = Camera {
@@ -418,12 +617,42 @@ fn main() {
         let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
 
         let ray = camera.shoot(&(clip_x, clip_y).into());
-        let some_hit = world.cast(&ray);
-        let refraction = some_hit
-            .map(|hit| world.get_refraction(&hit))
-            .unwrap_or(LinSrgb::new(0.0, 0.0, 0.0));
+        let hit = match world.cast(&ray){
+            Option::Some(hit) => hit,
+            Option::None => { continue; }
+        };
 
-        img[(x, y)] = img[(x, y)] + refraction;
+        let shade = world.get_shade(&hit);
+
+        let shiness = hit.object.material.get_shiness();
+        let reflection = if shiness > 0.0 {
+            let reflected_ray = world.get_reflect(&hit);
+            world.cast(&reflected_ray)
+                .map(|reflected_hit| world.get_shade(&reflected_hit))
+                .unwrap_or(LinSrgb::new(0.0, 0.0, 0.0))
+        } else {
+            LinSrgb::new(0.0, 0.0, 0.0)
+        };
+
+        let transparency = hit.object.material.get_transparency();
+        let refraction = if transparency > 0.0 {
+            match world.get_refract(&hit, 100.0) {
+                Refraction::Escaped { travel_distance, escape_ray } => {
+                    world.cast(&escape_ray)
+                        .map(|escape_hit| {
+                            let shade =  world.get_shade(&escape_hit);
+                            let decay = hit.object.material.get_opaque_decay();
+                            shade * decay.powf(travel_distance)
+                        })
+                        .unwrap_or(LinSrgb::new(0.0, 0.0, 0.0))
+                },
+                _ => LinSrgb::new(0.0, 0.0, 0.0)
+            }
+        } else {
+            LinSrgb::new(0.0, 0.0, 0.0)
+        };
+
+        img[(x, y)] = img[(x, y)] + (shade + reflection * shiness).mix(&refraction, transparency);
 
         if i % 50000 == 0 {
             let i = i as i64;

@@ -1,7 +1,7 @@
 use std;
 
-use cgmath::{EuclideanSpace, InnerSpace, Vector3};
-use palette::{LinSrgb};
+use cgmath::{InnerSpace, Vector3};
+use palette::{LinSrgb, Mix};
 
 use ::consts;
 use ::geometric::PositionNormalUV;
@@ -20,12 +20,16 @@ pub trait Material {
     fn get_specular(&self, probe: &MaterialProbe) -> LinSrgb;
     fn get_shiness(&self) -> f32;
 
-    fn get_refraction(&self, probe: &MaterialProbe) -> LinSrgb {
-        let shiness = self.get_shiness();
-        let diffuse = self.get_diffuse(&probe);
-        let specular = self.get_specular(&probe);
+    fn get_refraction_index(&self) -> f32;
+    fn get_opaque_decay(&self) -> f32;
+    fn get_transparency(&self) -> f32;
 
-        diffuse * (1.0 - shiness) + specular * shiness
+    fn get_shade(&self, probe: &MaterialProbe) -> LinSrgb {
+        let shiness = self.get_shiness();
+        let diffuse = self.get_diffuse(probe);
+        let specular = self.get_specular(probe);
+
+        diffuse.mix(&specular, shiness)
     }
 }
 
@@ -34,6 +38,10 @@ pub struct ColorMaterial {
     pub shiness: f32,
     pub specular_color: LinSrgb,
     pub smoothness: f32,
+
+    pub transparency: f32,
+    pub refraction_index: f32,
+    pub opaque_decay: f32,
 }
 
 impl Material for ColorMaterial {
@@ -65,5 +73,17 @@ impl Material for ColorMaterial {
 
     fn get_shiness(&self) -> f32 {
         self.shiness
+    }
+
+    fn get_refraction_index(&self) -> f32 {
+        self.refraction_index
+    }
+
+    fn get_opaque_decay(&self) -> f32 {
+        self.opaque_decay
+    }
+
+    fn get_transparency(&self) -> f32 {
+        self.transparency
     }
 }
