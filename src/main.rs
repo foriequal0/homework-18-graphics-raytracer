@@ -327,11 +327,6 @@ impl World {
             }.into()
         };
 
-        if hit.index == PrimitiveIndex::Sphere(1) {
-            let x = hit.ray.direction.normalize();
-            let y = refract_in.normalize();
-            let z = 1.0;
-        }
         // get out
         let mut hit_inside = match self.cast(&ray_inside) {
             Option::Some(hit) => hit,
