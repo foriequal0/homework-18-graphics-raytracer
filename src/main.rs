@@ -390,10 +390,10 @@ impl World {
             let shadow_ray = Ray {
                 origin: hit.at.position,
                 direction: -light.direction,
-                face_direction: FaceDirection::Both,
+                face_direction: FaceDirection::Back,
                 exclude: Exclusion {
                     index: hit.index,
-                    face_direction: FaceDirection::Both,
+                    face_direction: FaceDirection::Back,
                 }.into()
             };
 
