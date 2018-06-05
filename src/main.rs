@@ -387,7 +387,6 @@ impl World {
                 continue;
             }
 
-            // TODO: shadow ray through transparent object
             let shadow_ray = Ray {
                 origin: hit.at.position,
                 direction: -light.direction,
@@ -426,6 +425,42 @@ impl World {
             sum = sum + diffuse * (1.0 - shiness) + specular * shiness;
         }
         sum
+    }
+
+    fn ray_trace(&self, ray: &Ray, depth: i32) -> LinSrgb {
+        let hit = match self.cast(ray) {
+            Option::Some(hit) => hit,
+            Option::None => { return LinSrgb::new(0.0, 0.0, 0.0) }
+        };
+
+        let shade = self.get_shade(&hit);
+        if depth == 0 {
+            return shade;
+        }
+
+        let shiness = hit.object.material.get_shiness();
+        let reflection = if shiness > 0.0 {
+            let reflected_ray = self.get_reflect(&hit);
+            self.ray_trace(&reflected_ray, depth - 1)
+        } else {
+            LinSrgb::new(0.0, 0.0, 0.0)
+        };
+
+        let transparency = hit.object.material.get_transparency();
+        let refraction = if transparency > 0.0 {
+            match self.get_refract(&hit, 100.0) {
+                Refraction::Escaped { travel_distance, escape_ray } => {
+                    let shade = self.ray_trace(&escape_ray, depth - 1);
+                    let decay = hit.object.material.get_opaque_decay();
+                    shade * decay.powf(travel_distance)
+                },
+                _ => LinSrgb::new(0.0, 0.0, 0.0)
+            }
+        } else {
+            LinSrgb::new(0.0, 0.0, 0.0)
+        };
+
+        (shade + reflection * shiness).mix(&refraction, transparency)
     }
 }
 
@@ -617,42 +652,8 @@ fn main() {
         let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
 
         let ray = camera.shoot(&(clip_x, clip_y).into());
-        let hit = match world.cast(&ray){
-            Option::Some(hit) => hit,
-            Option::None => { continue; }
-        };
 
-        let shade = world.get_shade(&hit);
-
-        let shiness = hit.object.material.get_shiness();
-        let reflection = if shiness > 0.0 {
-            let reflected_ray = world.get_reflect(&hit);
-            world.cast(&reflected_ray)
-                .map(|reflected_hit| world.get_shade(&reflected_hit))
-                .unwrap_or(LinSrgb::new(0.0, 0.0, 0.0))
-        } else {
-            LinSrgb::new(0.0, 0.0, 0.0)
-        };
-
-        let transparency = hit.object.material.get_transparency();
-        let refraction = if transparency > 0.0 {
-            match world.get_refract(&hit, 100.0) {
-                Refraction::Escaped { travel_distance, escape_ray } => {
-                    world.cast(&escape_ray)
-                        .map(|escape_hit| {
-                            let shade =  world.get_shade(&escape_hit);
-                            let decay = hit.object.material.get_opaque_decay();
-                            shade * decay.powf(travel_distance)
-                        })
-                        .unwrap_or(LinSrgb::new(0.0, 0.0, 0.0))
-                },
-                _ => LinSrgb::new(0.0, 0.0, 0.0)
-            }
-        } else {
-            LinSrgb::new(0.0, 0.0, 0.0)
-        };
-
-        img[(x, y)] = img[(x, y)] + (shade + reflection * shiness).mix(&refraction, transparency);
+        img[(x, y)] = img[(x, y)] + world.ray_trace(&ray, 5);
 
         if i % 50000 == 0 {
             let i = i as i64;
