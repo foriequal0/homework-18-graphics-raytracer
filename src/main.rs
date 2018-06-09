@@ -650,13 +650,14 @@ fn main() {
         let screen_positions: Vec<_> = iproduct!(0..img.height, 0..img.width).collect::<Vec<_>>();
         let photons = screen_positions.par_iter()
             .cloned()
-            .map(|(y, x)| {
+            .map(|at| {
+                let (y, x) = at;
                 let clip_y = (img.height as f32 / 2.0 - y as f32) / img.height as f32;
                 let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
                 let ray = camera.shoot(&Vector2::new(clip_x, clip_y));
 
                 let photon = world.ray_trace(&ray, 5);
-                ((x, y), photon)
+                (at, photon)
             })
             .collect::<Vec<_>>();
         let mut ray_counts = 0;

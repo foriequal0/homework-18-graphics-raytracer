@@ -35,14 +35,14 @@ where
 impl<P> Index<(usize, usize)> for Image<P> {
     type Output = P;
     fn index(&self, index: (usize, usize)) -> &P {
-        let (x, y) = index;
+        let (y, x) = index;
         &self.pixels[y * self.width + x]
     }
 }
 
 impl<P> IndexMut<(usize, usize)> for Image<P> {
     fn index_mut(&mut self, index: (usize, usize)) -> &mut P {
-        let (x, y) = index;
+        let (y, x) = index;
         &mut self.pixels[y * self.width + x]
     }
 }
