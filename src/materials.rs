@@ -13,7 +13,7 @@ pub struct MaterialProbe
     pub light_direction: Vector3<f32>,
 }
 
-pub trait Material {
+pub trait Material: Send + Sync {
     fn adjust_normal(&self, at: PositionNormalUV) -> Vector3<f32>;
 
     fn get_diffuse(&self, probe: &MaterialProbe) -> LinSrgb;

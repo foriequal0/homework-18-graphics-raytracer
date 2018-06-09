@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::sync::Arc;
 
 use cgmath::{Point3, Vector3, InnerSpace};
 
@@ -6,7 +6,7 @@ use ::geometric::{HasPosition};
 use ::materials::Material;
 
 pub struct Object {
-    pub material: Rc<Material>,
+    pub material: Arc<Material>,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]

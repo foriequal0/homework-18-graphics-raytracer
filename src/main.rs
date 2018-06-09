@@ -6,6 +6,7 @@ extern crate num_traits;
 extern crate palette;
 extern crate png;
 extern crate stopwatch;
+extern crate rayon;
 
 mod photon;
 mod image;
@@ -17,14 +18,18 @@ mod consts;
 
 use std::convert::{From, Into};
 use std::fs::File;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::borrow::Borrow;
+use std::thread::spawn;
+use std::sync::mpsc::sync_channel;
 
 use cgmath::{Angle, Deg,
              EuclideanSpace, InnerSpace, MetricSpace,
              Point2, Point3, Vector2, Vector3, Matrix3};
 use palette::{LinSrgb, Srgb, IntoColor, Mix};
 use png::{Encoder, HasParameters};
+use rayon::prelude::*;
+use stopwatch::Stopwatch;
 
 use lights::{Light, Directional, Spot, Point, ApproximateIntoDirectional };
 use materials::{MaterialProbe, Material, ColorMaterial};
@@ -523,12 +528,10 @@ fn post_process(img: &mut Image<LinSrgb>) {
 }
 
 fn main() {
-    let mut img = Image::<LinSrgb>::new(640, 480);
-
     let mut world = World::new();
     world
         .push_object(Object {
-            material: Rc::new(ColorMaterial {
+            material: Arc::new(ColorMaterial {
                 diffuse_color: (1.0, 0.8, 0.6).into(),
                 shiness: 0.5,
                 specular_color: consts::linsrgb::white(),
@@ -548,7 +551,7 @@ fn main() {
     // 빨간공
     world
         .push_object(Object {
-            material: Rc::new(ColorMaterial {
+            material: Arc::new(ColorMaterial {
                 diffuse_color: (1.0, 0.2, 0.2).into(),
                 shiness: 0.2,
                 specular_color: consts::linsrgb::yellow(),
@@ -565,7 +568,7 @@ fn main() {
 
     world
         .push_object(Object{
-            material: Rc::new(ColorMaterial {
+            material: Arc::new(ColorMaterial {
                 diffuse_color: (1.0, 1.0, 1.0).into(),
                 shiness: 1.0,
                 specular_color: consts::linsrgb::white(),
@@ -582,7 +585,7 @@ fn main() {
 
     world
         .push_object(Object {
-            material: Rc::new(ColorMaterial {
+            material: Arc::new(ColorMaterial {
                 diffuse_color: (0.2, 0.5, 1.0).into(),
                 shiness: 0.9,
                 specular_color: consts::linsrgb::blue(),
@@ -599,7 +602,7 @@ fn main() {
 
     world
         .push_object(Object {
-            material: Rc::new(ColorMaterial {
+            material: Arc::new(ColorMaterial {
                 diffuse_color: (0.5, 1.0, 0.2).into(),
                 shiness: 0.5,
                 specular_color: consts::linsrgb::white(),
@@ -641,21 +644,31 @@ fn main() {
         near: -0.1,
     };
 
-    let sw = stopwatch::Stopwatch::start_new();
-    for (i, (y, x)) in iproduct!(0..img.height, 0..img.width).enumerate() {
-        let clip_y = (img.height as f32 / 2.0 - y as f32) / img.height as f32;
-        let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
+    let mut img = Image::<LinSrgb>::new(640, 480);
+    {
+        let mut sw = Stopwatch::start_new();
+        let screen_positions: Vec<_> = iproduct!(0..img.height, 0..img.width).collect::<Vec<_>>();
+        let photons = screen_positions.par_iter()
+            .cloned()
+            .map(|(y, x)| {
+                let clip_y = (img.height as f32 / 2.0 - y as f32) / img.height as f32;
+                let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
+                let ray = camera.shoot(&Vector2::new(clip_x, clip_y));
 
-        let ray = camera.shoot(&(clip_x, clip_y).into());
-
-        img[(x, y)] = img[(x, y)] + world.ray_trace(&ray, 5);
-
-        if i % 50000 == 0 {
-            let i = i as i64;
-            let elapsed = sw.elapsed_ms();
-            println!("{} rays in {} ms (avg: {} ray/s)", i, elapsed, i/(elapsed+1) * 1000);
+                let photon = world.ray_trace(&ray, 5);
+                ((x, y), photon)
+            })
+            .collect::<Vec<_>>();
+        let mut ray_counts = 0;
+        for (at, photon) in photons {
+            img[at] = img[at] + photon;
+            ray_counts += 1;
         }
+        sw.stop();
+        println!("{} rays in {} ms ({} rays/s)", ray_counts, sw.elapsed_ms(), ray_counts * 1000 / sw.elapsed_ms() as usize);
     }
+
+
     post_process(&mut img);
     {
         let encoded = Image::<Srgb<u8>>::convert_from(&img);
