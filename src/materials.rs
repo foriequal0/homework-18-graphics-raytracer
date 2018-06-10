@@ -1,6 +1,6 @@
 use std;
 
-use cgmath::{InnerSpace, Vector3};
+use cgmath::{InnerSpace, Point2, Vector3};
 use palette::{LinSrgb, Mix};
 
 use ::consts;
@@ -67,5 +67,36 @@ impl ColorMaterial{
         let specular = self.get_specular(probe);
 
         diffuse.mix(&specular, self.shiness)
+    }
+}
+
+#[derive(Clone)]
+pub struct GenerativeMaterial<F>
+where F: Fn(Point2<f32>) -> LinSrgb + Send + Sync
+{
+    pub diffuse_fn: F,
+    pub shiness: f32,
+    pub specular_color: LinSrgb,
+    pub smoothness: f32,
+
+    pub transparency: f32,
+    pub refraction_index: f32,
+    pub opaque_decay: f32,
+}
+
+impl<F> Material for GenerativeMaterial<F>
+where F: Fn(Point2<f32>) -> LinSrgb + Send + Sync
+{
+    fn approx(&self, at: PositionNormalUV) -> ColorMaterial {
+        let diffuse_fn = &self.diffuse_fn;
+        ColorMaterial {
+            diffuse_color: diffuse_fn(at.uv),
+            shiness: self.shiness,
+            specular_color: self.specular_color,
+            smoothness: self.smoothness,
+            transparency: self.transparency,
+            refraction_index: self.refraction_index,
+            opaque_decay: self.opaque_decay
+        }
     }
 }

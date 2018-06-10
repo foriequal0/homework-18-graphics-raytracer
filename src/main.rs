@@ -25,7 +25,7 @@ use std::mem::transmute;
 use cgmath::{Angle, Euler, Rad, Deg, Quaternion, Rotation,
              EuclideanSpace, InnerSpace, MetricSpace,
              Point2, Point3, Vector2, Vector3, Matrix2, Matrix3, SquareMatrix};
-use palette::{LinSrgb, Srgb, IntoColor};
+use palette::{LinSrgb, Srgb, IntoColor, Mix};
 use png::{Encoder, HasParameters};
 use rayon::prelude::*;
 use stopwatch::Stopwatch;
@@ -34,7 +34,7 @@ use rand::distributions::Normal;
 use rand::{ Rng, SeedableRng };
 
 use lights::{Light, Directional, Spot, Point, ApproximateIntoDirectional };
-use materials::{MaterialProbe, ColorMaterial};
+use materials::{MaterialProbe, ColorMaterial, GenerativeMaterial};
 use primitives::{PrimitiveIndex, Object, Triangle, Sphere, ObjectIndex, SphereGeometry};
 use geometric::{PositionNormalUV, PositionUV};
 use image::Image;
@@ -562,11 +562,12 @@ impl World {
                 let reflected = self.get_reflect(&scattered_hit);
                 if let Option::Some(reflected_hit) = self.cast(&reflected) {
                     let x = self.distributed_ray_trace(&mut state.nested(1.0), &reflected_hit);
-                    return self.get_shade(&scattered_hit) + x * material.get_specular(&MaterialProbe {
+                    let s = x * material.get_diffuse(&MaterialProbe {
                         at: scattered_hit.at,
                         view_direction: -hit.ray.direction,
                         light_direction: reflected.direction,
                     });
+                    return self.get_shade(&scattered_hit).mix(&s, 0.5);
                 } else {
                     return self.get_shade(&scattered_hit);
                 }
@@ -580,11 +581,12 @@ impl World {
                 let reflected = self.get_reflect(&scattered_hit);
                 if let Option::Some(reflected_hit) = self.cast(&reflected) {
                     let x = self.distributed_ray_trace(&mut state.nested(1.0), &reflected_hit);
-                    return self.get_shade(&scattered_hit) + x * material.get_specular(&MaterialProbe {
+                    let s = x * material.get_specular(&MaterialProbe {
                         at: scattered_hit.at,
                         view_direction: -hit.ray.direction,
                         light_direction: reflected.direction,
                     });
+                    return self.get_shade(&scattered_hit).mix(&s, 0.5);
                 } else {
                     return self.get_shade(&scattered_hit);
                 }
@@ -792,7 +794,30 @@ fn main() {
             PositionUV { position: (2.0, 0.0, 2.0).into(), uv: (1.0, 0.0).into() },
             PositionUV { position: (2.0, 0.0, -2.0).into(), uv: (0.0, 1.0).into() }
         ]));
-
+    world
+        .push_object(Object {
+            material: Arc::new(GenerativeMaterial {
+                diffuse_fn: |uv| {
+                    if (uv.y * 20.0) as i32 % 2 == 0 {
+                        LinSrgb::new(1.0, 1.0, 1.0)
+                    } else {
+                        LinSrgb::new(0.5, 0.5, 1.0)
+                    }
+                },
+                shiness: 0.0,
+                specular_color: consts::linsrgb::white(),
+                smoothness: 0.00001,
+                refraction_index: 1.0,
+                opaque_decay: 0.0,
+                transparency: 0.0,
+            })
+        })
+        .push_triangles(&square(&[
+            PositionUV { position: (-2.0, 2.0, -2.0).into(), uv: (0.0, 0.0).into() },
+            PositionUV { position: (-2.0, 2.0, 2.0).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-2.0, -2.0, 2.0).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (-2.0, -2.0, -2.0).into(), uv: (0.0, 1.0).into() }
+        ]));
     world
         .push_object(Object {
             material: Arc::new(ColorMaterial {
@@ -928,9 +953,15 @@ fn main() {
 
     world
         .push_object(Object {
-            material: Arc::new(ColorMaterial {
-                diffuse_color: (0.2, 0.5, 1.0).into(),
-                shiness: 0.9,
+            material: Arc::new(GenerativeMaterial {
+                diffuse_fn: |uv| {
+                    if ((uv.x + uv.y) * 10.0) as i32 % 2 == 0 {
+                        return LinSrgb::new(1.0, 0.1, 0.1);
+                    } else {
+                        return LinSrgb::new(0.1, 0.1, 1.0);
+                    }
+                },
+                shiness: 0.3,
                 specular_color: consts::linsrgb::blue(),
                 smoothness: 0.7,
                 refraction_index: 1.0,
