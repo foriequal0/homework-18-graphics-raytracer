@@ -7,6 +7,7 @@ extern crate palette;
 extern crate png;
 extern crate stopwatch;
 extern crate rayon;
+extern crate rand;
 
 mod photon;
 mod image;
@@ -19,20 +20,21 @@ mod consts;
 use std::convert::{From, Into};
 use std::fs::File;
 use std::sync::Arc;
-use std::borrow::Borrow;
-use std::thread::spawn;
-use std::sync::mpsc::sync_channel;
+use std::mem::transmute;
 
-use cgmath::{Angle, Deg,
+use cgmath::{Angle, Euler, Rad, Deg, Quaternion, Rotation,
              EuclideanSpace, InnerSpace, MetricSpace,
-             Point2, Point3, Vector2, Vector3, Matrix3};
-use palette::{LinSrgb, Srgb, IntoColor, Mix};
+             Point2, Point3, Vector2, Vector3, Matrix2, Matrix3, SquareMatrix};
+use palette::{LinSrgb, Srgb, IntoColor};
 use png::{Encoder, HasParameters};
 use rayon::prelude::*;
 use stopwatch::Stopwatch;
+use rand::prng::IsaacRng;
+use rand::distributions::Normal;
+use rand::{ Rng, SeedableRng };
 
 use lights::{Light, Directional, Spot, Point, ApproximateIntoDirectional };
-use materials::{MaterialProbe, Material, ColorMaterial};
+use materials::{MaterialProbe, ColorMaterial};
 use primitives::{PrimitiveIndex, Object, Triangle, Sphere, ObjectIndex, SphereGeometry};
 use geometric::{PositionNormalUV, PositionUV};
 use image::Image;
@@ -94,6 +96,34 @@ impl Camera {
             face_direction: FaceDirection::Front,
         }
     }
+
+    fn shoot_focus<R>(&self, clip: &Vector2<f32>, state: &mut DistributeState<&mut R>, focus: f32, blur: f32) -> Ray
+    where R: Rng
+    {
+        let toward = self.toward.normalize();
+        let right = toward.cross(self.up).normalize();
+        let up = right.cross(toward).normalize();
+
+        let x = (self.fovy / 2.0).tan() * right;
+        let y = (self.fovy / 2.0).tan() * up;
+        let direction = (clip.x * x + clip.y * y + toward).normalize();
+
+        let xoffset = state.rng.sample(Normal::new(0.0, blur as f64)) as f32;
+        let yoffset = state.rng.sample(Normal::new(0.0, blur as f64)) as f32;
+
+        let direction_offset = (direction * focus
+            + x * xoffset
+            + y * yoffset).normalize();
+        let origin = self.center
+            + toward.normalize() * self.near
+            - (x * xoffset + y * yoffset);
+        Ray {
+            origin,
+            direction: direction_offset,
+            exclude: Option::None,
+            face_direction: FaceDirection::Front,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -105,6 +135,7 @@ struct World {
     lights: Vec<Light>,
 }
 
+#[derive(Copy, Clone)]
 struct Hit<'a> {
     object: &'a Object,
     ray: Ray,
@@ -319,9 +350,12 @@ impl World {
             }
         };
 
-        let k = hit.object.material.get_refraction_index();
-        let refract_in = refract(hit.at.normal, hit.ray.direction, k)
-            .expect("Refraction index must larger than 1.0, then it'll never fail");
+        let k = hit.object.material.approx(hit.at).refraction_index;
+        let refract_in = refract(hit.at.normal, hit.ray.direction, k);
+        if refract_in.is_none() {
+            return Refraction::Trapped;
+        }
+        let refract_in = refract_in.unwrap();
         let ray_inside = Ray {
             origin: hit.at.position,
             direction: refract_in.normalize(),
@@ -370,9 +404,9 @@ impl World {
     }
 
     fn get_shade(&self, hit: &Hit) -> LinSrgb {
-        let material: &Material = hit.object.material.borrow();
+        let material = hit.object.material.approx(hit.at);
         let ray = hit.ray;
-        let normal = material.adjust_normal(hit.at);
+        let normal = material.adjust_normal(hit.at.normal);
 
         let mut sum = LinSrgb::new(0.0, 0.0, 0.0);
         for light in &self.lights {
@@ -419,40 +453,58 @@ impl World {
             };
 
             // to_light, normal
-            let shiness = material.get_shiness();
+            let shiness = material.shiness;
             let diffuse = material.get_diffuse(&probe) * light.color;
             let specular = material.get_specular(&probe) * light.color;
+
             sum = sum + diffuse * (1.0 - shiness) + specular * shiness;
         }
         sum
     }
 
-    fn ray_trace(&self, ray: &Ray, depth: i32) -> LinSrgb {
+    fn ray_trace(&self, state: &TraceState, ray: &Ray) -> LinSrgb {
+        const THRESHOLD: f32 = 0.001;
+
+        if state.contribution < THRESHOLD {
+            return LinSrgb::new(0.0, 0.0, 0.0);
+        }
+
         let hit = match self.cast(ray) {
             Option::Some(hit) => hit,
             Option::None => { return LinSrgb::new(0.0, 0.0, 0.0) }
         };
 
-        let shade = self.get_shade(&hit);
-        if depth == 0 {
-            return shade;
-        }
+        let material = hit.object.material.approx(hit.at);
 
-        let shiness = hit.object.material.get_shiness();
-        let reflection = if shiness > 0.0 {
-            let reflected_ray = self.get_reflect(&hit);
-            self.ray_trace(&reflected_ray, depth - 1)
+        let shade_contribution = (1.0 - material.shiness) * (1.0 - material.transparency);
+        let shade_state = state.nested(shade_contribution);
+        let shade = if shade_state.contribution >= THRESHOLD {
+            self.get_shade(&hit)
         } else {
             LinSrgb::new(0.0, 0.0, 0.0)
         };
 
-        let transparency = hit.object.material.get_transparency();
-        let refraction = if transparency > 0.0 {
+        if state.depth <= 0 {
+            return shade;
+        }
+
+
+        let reflection_contribution = material.shiness * (1.0 -material.transparency);
+        let reflection_state = state.nested(reflection_contribution);
+        let reflection = if reflection_state.contribution >= THRESHOLD {
+            let reflected_ray = self.get_reflect(&hit);
+            self.ray_trace(&reflection_state, &reflected_ray)
+        } else {
+            LinSrgb::new(0.0, 0.0, 0.0)
+        };
+
+        let refraction_contribution = material.transparency;
+        let refraction_state = state.nested(refraction_contribution);
+        let refraction = if refraction_state.contribution > THRESHOLD {
             match self.get_refract(&hit, 100.0) {
                 Refraction::Escaped { travel_distance, escape_ray } => {
-                    let shade = self.ray_trace(&escape_ray, depth - 1);
-                    let decay = hit.object.material.get_opaque_decay();
-                    shade * decay.powf(travel_distance)
+                    let shade = self.ray_trace(&refraction_state, &escape_ray);
+                    shade * material.opaque_decay.powf(travel_distance)
                 },
                 _ => LinSrgb::new(0.0, 0.0, 0.0)
             }
@@ -460,7 +512,185 @@ impl World {
             LinSrgb::new(0.0, 0.0, 0.0)
         };
 
-        (shade + reflection * shiness).mix(&refraction, transparency)
+        shade * shade_contribution
+            + reflection * reflection_contribution
+            + refraction * refraction_contribution
+    }
+
+    fn distributed_ray_trace<R>(&self, state: &mut DistributeState<&mut R>, hit: &Hit) -> LinSrgb
+    where R: Rng
+    {
+        let shade = self.get_shade(&hit);
+        if state.depth <= 0 {
+            return shade;
+        }
+
+        let material = hit.object.material.approx(hit.at);
+
+        #[derive(Copy, Clone)]
+        enum RayType { Diffuse, Reflection, Refraction }
+        let selected_type = weighted_select(state.rng, &[
+            ((1.0 - material.shiness) * (1.0 - material.transparency), RayType::Diffuse),
+            (material.shiness * (1.0 - material.transparency), RayType::Reflection),
+            (material.transparency, RayType::Refraction)
+        ]);
+
+        fn scatter_hit<'a, R>(state: &mut DistributeState<&mut R>,
+                       hit: &Hit<'a>, direction: Vector3<f32>, exponent: f32) -> Hit<'a>
+        where R: Rng
+        {
+            let phi = (1.0 - state.rng.gen_range::<f32>(0.0, 1.0)).powf(exponent).acos();
+            let theta = state.rng.gen_range(-std::f32::consts::PI, std::f32::consts::PI);
+            let z = Vector3::new(0.0, 0.0, 1.0);
+            let from_z = Quaternion::from_arc(z, direction.normalize(), None);
+            let new_dir = from_z * Vector3::new(phi.sin() * theta.cos(),
+                                                phi.sin() * theta.sin(),
+                                                phi.cos());
+
+            let mut out = hit.clone();
+            out.ray.direction = new_dir;
+            out
+        };
+
+        match selected_type {
+            RayType::Diffuse => {
+                let scattered_hit = scatter_hit(state, &hit, -hit.at.normal, 1.0);
+                let cosine = -hit.at.normal.dot(scattered_hit.ray.direction);
+                if cosine <= 0.0 {
+                    return LinSrgb::new(0.0, 0.0, 0.0);
+                }
+                let reflected = self.get_reflect(&scattered_hit);
+                if let Option::Some(reflected_hit) = self.cast(&reflected) {
+                    let x = self.distributed_ray_trace(&mut state.nested(1.0), &reflected_hit);
+                    return self.get_shade(&scattered_hit) + x * material.get_specular(&MaterialProbe {
+                        at: scattered_hit.at,
+                        view_direction: -hit.ray.direction,
+                        light_direction: reflected.direction,
+                    });
+                } else {
+                    return self.get_shade(&scattered_hit);
+                }
+            },
+            RayType::Reflection => {
+                let scattered_hit = scatter_hit(state, &hit, hit.ray.direction, material.smoothness);
+                let cosine = -hit.at.normal.dot(scattered_hit.ray.direction);
+                if cosine <= 0.0 {
+                    return LinSrgb::new(0.0, 0.0, 0.0);
+                }
+                let reflected = self.get_reflect(&scattered_hit);
+                if let Option::Some(reflected_hit) = self.cast(&reflected) {
+                    let x = self.distributed_ray_trace(&mut state.nested(1.0), &reflected_hit);
+                    return self.get_shade(&scattered_hit) + x * material.get_specular(&MaterialProbe {
+                        at: scattered_hit.at,
+                        view_direction: -hit.ray.direction,
+                        light_direction: reflected.direction,
+                    });
+                } else {
+                    return self.get_shade(&scattered_hit);
+                }
+            },
+            RayType::Refraction => {
+                let scattered_hit = scatter_hit(state, &hit, hit.ray.direction, material.smoothness);
+                let cosine = -hit.at.normal.dot(scattered_hit.ray.direction);
+                if cosine <= 0.0 {
+                    return LinSrgb::new(0.0, 0.0, 0.0);
+                }
+                match self.get_refract(&scattered_hit, 100.0) {
+                    Refraction::Escaped { travel_distance, escape_ray } => {
+                        if let Option::Some(refracted_hit) = self.cast(&escape_ray) {
+                            let x = self.distributed_ray_trace(&mut state.nested(1.0), &refracted_hit);
+                            return x * material.opaque_decay.powf(travel_distance)
+                        } else {
+                            return LinSrgb::new(0.0, 0.0, 0.0);
+                        }
+                    },
+                    _ => LinSrgb::new(0.0, 0.0, 0.0)
+                }
+            }
+        }
+    }
+
+    fn get_up_right(&self, hit: &Hit) -> (Vector3<f32>, Vector3<f32>) {
+        match hit.index {
+            PrimitiveIndex::Triangle(idx) => {
+                let triangle = &self.triangles[idx];
+                let a = triangle.vertices[1].position - triangle.vertices[0].position;
+                let b = triangle.vertices[2].position - triangle.vertices[0].position;
+                let uv1 = triangle.vertices[1].uv - triangle.vertices[0].uv;
+                let uv2 = triangle.vertices[2].uv - triangle.vertices[0].uv;
+
+                let uv_mat = Matrix2::from_cols(uv1, uv2).invert().unwrap();
+                let ab_row = [
+                    Vector2::new(a.x, b.x),
+                    Vector2::new(a.y, b.y),
+                    Vector2::new(a.z, b.z),
+                ];
+                let up = Vector3::new(
+                    ab_row[0].dot(uv_mat[0]),
+                    ab_row[1].dot(uv_mat[0]),
+                    ab_row[2].dot(uv_mat[0])
+                );
+                let right = Vector3::new(
+                    ab_row[0].dot(uv_mat[1]),
+                    ab_row[1].dot(uv_mat[1]),
+                    ab_row[2].dot(uv_mat[1])
+                );
+                (up.normalize(), right.normalize())
+            },
+            PrimitiveIndex::Sphere(_) => {
+                let right = Vector3::new(0.0, 1.0, 0.0).cross(hit.at.normal).normalize();
+                let up = hit.at.normal.cross(right).normalize();
+                (up, right)
+            }
+        }
+    }
+}
+
+fn weighted_select<R, T>(rng: &mut R, weights: &[(f32, T)]) -> T
+where R: Rng, T: Copy
+{
+    assert!(weights.len() > 0);
+    let sum = weights.iter().map(|(w, _)| w).sum();
+    let r = rng.gen_range(0.0, sum);
+    let mut accum = 0.0;
+    for (w, v) in weights {
+        accum += w;
+        if r < accum {
+            return *v;
+        }
+    }
+    weights.iter().cloned().map(|(_, v)| v).last().unwrap()
+}
+
+struct TraceState {
+    depth: i32,
+    contribution: f32,
+}
+
+impl TraceState {
+    fn nested(&self, decay: f32) -> TraceState {
+        TraceState {
+            depth: self.depth - 1,
+            contribution: self.contribution * decay,
+        }
+    }
+}
+
+struct DistributeState<R> {
+    coord: (usize, usize),
+    depth: i32,
+    contribution: f32,
+    rng: R,
+}
+
+impl<'a, R> DistributeState<&'a mut R> {
+    fn nested<'b>(&'b mut self, decay: f32) -> DistributeState<&'b mut R> {
+        DistributeState {
+            coord: self.coord,
+            depth: self.depth - 1,
+            contribution: self.contribution * decay,
+            rng: self.rng
+        }
     }
 }
 
@@ -515,6 +745,7 @@ fn square(vertices: &[PositionUV; 4]) -> [[PositionNormalUV; 3]; 2] {
 fn post_process(img: &mut Image<LinSrgb>) {
     let mut luma_cumulative: Vec<f32> = img.as_slice().iter().cloned()
         .map(|x| x.into_luma().luma)
+        .filter(|x| x.is_normal())
         .collect();
     luma_cumulative.sort_by(|a, b| (*a).partial_cmp(b).unwrap());
     let p98 = luma_cumulative[(luma_cumulative.len() as f32 * 0.99) as usize];
@@ -527,15 +758,29 @@ fn post_process(img: &mut Image<LinSrgb>) {
     // TODO: highlight bloom effect
 }
 
+fn write_to_file(name: &str, img: &Image<LinSrgb>) {
+    {
+        let encoded = Image::<Srgb<u8>>::convert_from(&img);
+        let out_file = File::create("./tmp.png").unwrap();
+        let mut encoder = Encoder::new(
+            out_file, encoded.width as u32, encoded.height as u32);
+        encoder.set(png::ColorType::RGB);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(encoded.as_raw_slice()).unwrap();
+    }
+    use std::fs::rename;
+    rename("./tmp.png", name).unwrap();
+}
+
 fn main() {
     let mut world = World::new();
     world
         .push_object(Object {
             material: Arc::new(ColorMaterial {
                 diffuse_color: (1.0, 0.8, 0.6).into(),
-                shiness: 0.5,
+                shiness: 0.8,
                 specular_color: consts::linsrgb::white(),
-                smoothness: 1.0,
+                smoothness: 0.01,
                 refraction_index: 1.0,
                 opaque_decay: 0.0,
                 transparency: 0.0,
@@ -546,6 +791,104 @@ fn main() {
             PositionUV { position: (-2.0, 0.0, 2.0).into(), uv: (0.0, 1.0).into() },
             PositionUV { position: (2.0, 0.0, 2.0).into(), uv: (1.0, 0.0).into() },
             PositionUV { position: (2.0, 0.0, -2.0).into(), uv: (0.0, 1.0).into() }
+        ]));
+
+    world
+        .push_object(Object {
+            material: Arc::new(ColorMaterial {
+                diffuse_color: (1.0, 0.8, 0.6).into(),
+                shiness: 1.0,
+                specular_color: consts::linsrgb::white(),
+                smoothness: 0.00001,
+                refraction_index: 1.6,
+                opaque_decay: 0.1,
+                transparency: 1.0,
+            })
+        })
+        .push_triangles(&square(&[
+            PositionUV { position: (0.5, 1.5, 0.7).into(), uv: (0.0, 0.0).into() },
+            PositionUV { position: (-0.5, 1.5, 0.7).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.5, 1.0, 0.7).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (0.5, 1.0, 0.7).into(), uv: (0.0, 1.0).into() }
+        ]))
+        .push_triangles(&square(&[
+            PositionUV { position: (0.5, 1.0, 0.6).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.5, 1.0, 0.6).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (-0.5, 1.5, 0.6).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.5, 1.5, 0.6).into(), uv: (0.0, 0.0).into() },
+        ]))
+        .push_triangles(&square(&[
+            PositionUV { position: (0.5, 1.5, 0.6).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.5, 1.5, 0.6).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (-0.5, 1.5, 0.7).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.5, 1.5, 0.7).into(), uv: (0.0, 0.0).into() },
+        ]))
+        .push_triangles(&square(&[
+            PositionUV { position: (0.5, 1.0, 0.7).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.5, 1.0, 0.7).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (-0.5, 1.0, 0.6).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.5, 1.0, 0.6).into(), uv: (0.0, 0.0).into() },
+        ]))
+        .push_triangles(&square(&[
+            PositionUV { position: (-0.5, 1.5, 0.6).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.5, 1.0, 0.6).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (-0.5, 1.0, 0.7).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.5, 1.5, 0.7).into(), uv: (0.0, 0.0).into() },
+        ]))
+        .push_triangles(&square(&[
+            PositionUV { position: (0.5, 1.0, 0.6).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.5, 1.5, 0.6).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (0.5, 1.5, 0.7).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.5, 1.0, 0.7).into(), uv: (0.0, 0.0).into() },
+        ]));
+
+    world
+        .push_object(Object {
+            material: Arc::new(ColorMaterial {
+                diffuse_color: (1.0, 0.8, 0.6).into(),
+                shiness: 1.0,
+                specular_color: consts::linsrgb::white(),
+                smoothness: 0.00001,
+                refraction_index: 1.6,
+                opaque_decay: 0.1,
+                transparency: 1.0,
+            })
+        })
+        .push_triangles(&square(&[
+            PositionUV { position: (0.3, 1.5, 0.81).into(), uv: (0.0, 0.0).into() },
+            PositionUV { position: (-0.3, 1.5, 0.81).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.3, 1.0, 0.81).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (0.3, 1.0, 0.81).into(), uv: (0.0, 1.0).into() }
+        ]))
+        .push_triangles(&square(&[
+            PositionUV { position: (0.3, 1.0, 0.71).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.3, 1.0, 0.71).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (-0.3, 1.5, 0.71).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.3, 1.5, 0.71).into(), uv: (0.0, 0.0).into() },
+        ]))
+        .push_triangles(&square(&[
+            PositionUV { position: (0.3, 1.5, 0.71).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.3, 1.5, 0.71).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (-0.3, 1.5, 0.81).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.3, 1.5, 0.81).into(), uv: (0.0, 0.0).into() },
+        ]))
+        .push_triangles(&square(&[
+            PositionUV { position: (-0.3, 1.5, 0.71).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.3, 1.0, 0.71).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (-0.3, 1.0, 0.81).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.3, 1.5, 0.81).into(), uv: (0.0, 0.0).into() },
+        ]))
+        .push_triangles(&square(&[
+            PositionUV { position: (0.3, 1.0, 0.81).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (-0.3, 1.0, 0.81).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (-0.3, 1.0, 0.71).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.3, 1.0, 0.71).into(), uv: (0.0, 0.0).into() },
+        ]))
+        .push_triangles(&square(&[
+            PositionUV { position: (0.3, 1.0, 0.71).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.3, 1.5, 0.71).into(), uv: (1.0, 0.0).into() },
+            PositionUV { position: (0.3, 1.5, 0.81).into(), uv: (0.0, 1.0).into() },
+            PositionUV { position: (0.3, 1.0, 0.81).into(), uv: (0.0, 0.0).into() },
         ]));
 
     // 빨간공
@@ -561,24 +904,24 @@ fn main() {
                 transparency: 0.0,
             })
         })
-        .push_sphere(&SphereGeometry{
+        .push_sphere(&SphereGeometry {
             center: (-0.5, 0.5, 0.5 / 3.0f32.sqrt()).into(),
             radius: 0.5,
         });
 
     world
-        .push_object(Object{
+        .push_object(Object {
             material: Arc::new(ColorMaterial {
                 diffuse_color: (1.0, 1.0, 1.0).into(),
                 shiness: 1.0,
                 specular_color: consts::linsrgb::white(),
-                smoothness: 0.01,
+                smoothness: 0.001,
                 refraction_index: 1.12,
                 opaque_decay: 0.3,
                 transparency: 0.96,
             })
         })
-        .push_sphere(&SphereGeometry{
+        .push_sphere(&SphereGeometry {
             center: (0.5, 0.5, 0.5 / 3.0f32.sqrt()).into(),
             radius: 0.5,
         });
@@ -595,7 +938,7 @@ fn main() {
                 transparency: 0.0,
             })
         })
-        .push_sphere(&SphereGeometry{
+        .push_sphere(&SphereGeometry {
             center: (0.0, 0.5, -1.0 / 3.0f32.sqrt()).into(),
             radius: 0.5,
         });
@@ -612,8 +955,8 @@ fn main() {
                 transparency: 0.0,
             })
         })
-        .push_sphere(&SphereGeometry{
-            center: (0.0, 0.5 + (2.0f32/3.0).sqrt(), 0.0).into(),
+        .push_sphere(&SphereGeometry {
+            center: (0.0, 0.5 + (2.0f32 / 3.0).sqrt(), 0.0).into(),
             radius: 0.5,
         });
 
@@ -644,7 +987,7 @@ fn main() {
         near: -0.1,
     };
 
-    let mut img = Image::<LinSrgb>::new(640, 480);
+    let mut img = Image::<LinSrgb>::new(1280, 960);
     {
         let mut sw = Stopwatch::start_new();
         let screen_positions: Vec<_> = iproduct!(0..img.height, 0..img.width).collect::<Vec<_>>();
@@ -655,8 +998,11 @@ fn main() {
                 let clip_y = (img.height as f32 / 2.0 - y as f32) / img.height as f32;
                 let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
                 let ray = camera.shoot(&Vector2::new(clip_x, clip_y));
-
-                let photon = world.ray_trace(&ray, 5);
+                let state = TraceState {
+                    depth: 5,
+                    contribution: 1.0
+                };
+                let photon = world.ray_trace(&state, &ray);
                 (at, photon)
             })
             .collect::<Vec<_>>();
@@ -667,17 +1013,66 @@ fn main() {
         }
         sw.stop();
         println!("{} rays in {} ms ({} rays/s)", ray_counts, sw.elapsed_ms(), ray_counts * 1000 / sw.elapsed_ms() as usize);
+
+        post_process(&mut img);
+        write_to_file("./out.png", &img);
     }
 
+    let mut distribute_states: Vec<_> = iproduct!(0..img.height, 0..img.width)
+        .map(|at| {;
+            let seed = at.0 as u64 * (2<<32) + at.1 as u64;
+            DistributeState {
+                coord: at,
+                depth: 0,
+                contribution: 1.0,
+                rng: IsaacRng::new_from_u64(seed)
+            }
+        })
+        .collect::<Vec<_>>();
 
-    post_process(&mut img);
-    {
-        let encoded = Image::<Srgb<u8>>::convert_from(&img);
-        let out_file = File::create("./out.png").unwrap();
-        let mut encoder = Encoder::new(
-                out_file, encoded.width as u32, encoded.height as u32);
-        encoder.set(png::ColorType::RGB);
-        let mut writer = encoder.write_header().unwrap();
-        writer.write_image_data(encoded.as_raw_slice()).unwrap();
+    for i in 0..100 {
+        let mut sw = Stopwatch::start_new();
+        let photons = distribute_states.par_iter_mut()
+            .map(|mut state| {
+                let (y, x) = state.coord;
+                let clip_y = (img.height as f32 / 2.0 - y as f32) / img.height as f32;
+                let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
+
+                let mut state = DistributeState {
+                    coord: state.coord,
+                    depth: 5,
+                    contribution: 1.0,
+                    rng: &mut state.rng
+                };
+
+                let ray = camera.shoot_focus(
+                    &Vector2::new(clip_x, clip_y),
+                    &mut state,
+                    3.0,
+                    0.02
+                );
+                if let Option::Some(hit) = world.cast(&ray) {
+                    let photon = world.distributed_ray_trace(&mut state, &hit);
+                    (state.coord, photon)
+                } else {
+                    (state.coord, LinSrgb::new(0.0, 0.0, 0.0))
+                }
+            })
+            .filter(|(at, photon)| {
+                let cat = [photon.red, photon.green, photon.blue];
+                cat.iter().all(|x| x.is_normal())
+            })
+            .collect::<Vec<_>>();
+        let mut ray_counts = 0;
+        for (at, photon) in photons {
+
+            img[at] = img[at] + photon;
+            ray_counts += 1;
+        }
+        sw.stop();
+        println!("{} rays in {} ms ({} rays/s)", ray_counts, sw.elapsed_ms(), ray_counts * 1000 / sw.elapsed_ms() as usize);
+
+        post_process(&mut img);
+        write_to_file("./out.png", &img);
     }
 }

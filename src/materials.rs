@@ -14,25 +14,10 @@ pub struct MaterialProbe
 }
 
 pub trait Material: Send + Sync {
-    fn adjust_normal(&self, at: PositionNormalUV) -> Vector3<f32>;
-
-    fn get_diffuse(&self, probe: &MaterialProbe) -> LinSrgb;
-    fn get_specular(&self, probe: &MaterialProbe) -> LinSrgb;
-    fn get_shiness(&self) -> f32;
-
-    fn get_refraction_index(&self) -> f32;
-    fn get_opaque_decay(&self) -> f32;
-    fn get_transparency(&self) -> f32;
-
-    fn get_shade(&self, probe: &MaterialProbe) -> LinSrgb {
-        let shiness = self.get_shiness();
-        let diffuse = self.get_diffuse(probe);
-        let specular = self.get_specular(probe);
-
-        diffuse.mix(&specular, shiness)
-    }
+    fn approx(&self, at: PositionNormalUV) -> ColorMaterial;
 }
 
+#[derive(Copy, Clone)]
 pub struct ColorMaterial {
     pub diffuse_color: LinSrgb,
     pub shiness: f32,
@@ -45,11 +30,17 @@ pub struct ColorMaterial {
 }
 
 impl Material for ColorMaterial {
-    fn adjust_normal(&self, at: PositionNormalUV) -> Vector3<f32> {
-        at.normal
+    fn approx(&self, at: PositionNormalUV) -> ColorMaterial {
+        self.clone()
+    }
+}
+
+impl ColorMaterial{
+    pub fn adjust_normal(&self, normal: Vector3<f32>) -> Vector3<f32> {
+        normal
     }
 
-    fn get_diffuse(&self, probe: &MaterialProbe) -> LinSrgb {
+    pub fn get_diffuse(&self, probe: &MaterialProbe) -> LinSrgb {
         let cosine = probe.light_direction.dot(probe.at.normal);
         if cosine > 0.0 {
             self.diffuse_color * cosine
@@ -58,7 +49,7 @@ impl Material for ColorMaterial {
         }
     }
 
-    fn get_specular(&self, probe: &MaterialProbe) -> LinSrgb {
+    pub fn get_specular(&self, probe: &MaterialProbe) -> LinSrgb {
         let cosine = probe.light_direction.dot(probe.at.normal);
         if cosine <= 0.0 {
             return consts::linsrgb::black()
@@ -71,19 +62,10 @@ impl Material for ColorMaterial {
         self.specular_color * specular_amount
     }
 
-    fn get_shiness(&self) -> f32 {
-        self.shiness
-    }
+    pub fn get_shade(&self, probe: &MaterialProbe) -> LinSrgb {
+        let diffuse = self.get_diffuse(probe);
+        let specular = self.get_specular(probe);
 
-    fn get_refraction_index(&self) -> f32 {
-        self.refraction_index
-    }
-
-    fn get_opaque_decay(&self) -> f32 {
-        self.opaque_decay
-    }
-
-    fn get_transparency(&self) -> f32 {
-        self.transparency
+        diffuse.mix(&specular, self.shiness)
     }
 }
