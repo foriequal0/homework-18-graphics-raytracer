@@ -1,6 +1,6 @@
 use std;
 
-use cgmath::{InnerSpace, Point2, Vector3};
+use cgmath::{InnerSpace, Point2, Vector3, Quaternion};
 use palette::{LinSrgb, Mix};
 
 use ::consts;
@@ -19,6 +19,7 @@ pub trait Material: Send + Sync {
 
 #[derive(Copy, Clone)]
 pub struct ColorMaterial {
+    pub normal: Vector3<f32>,
     pub diffuse_color: LinSrgb,
     pub shiness: f32,
     pub specular_color: LinSrgb,
@@ -37,7 +38,9 @@ impl Material for ColorMaterial {
 
 impl ColorMaterial{
     pub fn adjust_normal(&self, normal: Vector3<f32>) -> Vector3<f32> {
-        normal
+        let z = Vector3::new(0.0, 0.0, 1.0);
+        let from_z = Quaternion::from_arc(z, normal, None);
+        from_z * self.normal
     }
 
     pub fn get_diffuse(&self, probe: &MaterialProbe) -> LinSrgb {
@@ -61,20 +64,15 @@ impl ColorMaterial{
             .max(0.0).powf(specular) * energy_conserving;
         self.specular_color * specular_amount
     }
-
-    pub fn get_shade(&self, probe: &MaterialProbe) -> LinSrgb {
-        let diffuse = self.get_diffuse(probe);
-        let specular = self.get_specular(probe);
-
-        diffuse.mix(&specular, self.shiness)
-    }
 }
 
 #[derive(Clone)]
-pub struct GenerativeMaterial<F>
-where F: Fn(Point2<f32>) -> LinSrgb + Send + Sync
+pub struct GenerativeMaterial<F, G>
+where F: Fn(Point2<f32>) -> LinSrgb + Send + Sync,
+      G: Fn(Point2<f32>) -> Vector3<f32> + Send + Sync
 {
     pub diffuse_fn: F,
+    pub normal_fn: G,
     pub shiness: f32,
     pub specular_color: LinSrgb,
     pub smoothness: f32,
@@ -84,13 +82,16 @@ where F: Fn(Point2<f32>) -> LinSrgb + Send + Sync
     pub opaque_decay: f32,
 }
 
-impl<F> Material for GenerativeMaterial<F>
-where F: Fn(Point2<f32>) -> LinSrgb + Send + Sync
+impl<F, G> Material for GenerativeMaterial<F, G>
+where F: Fn(Point2<f32>) -> LinSrgb + Send + Sync,
+      G: Fn(Point2<f32>) -> Vector3<f32> + Send + Sync
 {
     fn approx(&self, at: PositionNormalUV) -> ColorMaterial {
         let diffuse_fn = &self.diffuse_fn;
+        let normal_fn = &self.normal_fn;
         ColorMaterial {
             diffuse_color: diffuse_fn(at.uv),
+            normal: normal_fn(at.uv),
             shiness: self.shiness,
             specular_color: self.specular_color,
             smoothness: self.smoothness,

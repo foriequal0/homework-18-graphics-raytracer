@@ -786,6 +786,7 @@ fn main() {
                 refraction_index: 1.0,
                 opaque_decay: 0.0,
                 transparency: 0.0,
+                normal: Vector3::new(0.0, 0.0, 1.0),
             })
         })
         .push_triangles(&square(&[
@@ -804,6 +805,15 @@ fn main() {
                         LinSrgb::new(0.5, 0.5, 1.0)
                     }
                 },
+                normal_fn: |uv| {
+                    let angle = uv.x * 10.0 * 2.0 * std::f32::consts::PI;
+                    let v = Vector3::new(angle.sin(), 0.0, angle.cos());
+                    if v.dot(Vector3::new(0.0, 0.0, 1.0)) <= 0.0 {
+                        -v
+                    } else {
+                        v
+                    }
+                },
                 shiness: 0.0,
                 specular_color: consts::linsrgb::white(),
                 smoothness: 0.00001,
@@ -816,8 +826,9 @@ fn main() {
             PositionUV { position: (-2.0, 2.0, -2.0).into(), uv: (0.0, 0.0).into() },
             PositionUV { position: (-2.0, 2.0, 2.0).into(), uv: (0.0, 1.0).into() },
             PositionUV { position: (-2.0, -2.0, 2.0).into(), uv: (1.0, 0.0).into() },
-            PositionUV { position: (-2.0, -2.0, -2.0).into(), uv: (0.0, 1.0).into() }
+            PositionUV { position: (-2.0, -2.0, -2.0).into(), uv: (1.0, 1.0).into() }
         ]));
+
     world
         .push_object(Object {
             material: Arc::new(ColorMaterial {
@@ -828,6 +839,7 @@ fn main() {
                 refraction_index: 1.6,
                 opaque_decay: 0.1,
                 transparency: 1.0,
+                normal: Vector3::new(0.0, 0.0, 1.0),
             })
         })
         .push_triangles(&square(&[
@@ -877,6 +889,7 @@ fn main() {
                 refraction_index: 1.6,
                 opaque_decay: 0.1,
                 transparency: 1.0,
+                normal: Vector3::new(0.0, 0.0, 1.0),
             })
         })
         .push_triangles(&square(&[
@@ -927,6 +940,7 @@ fn main() {
                 refraction_index: 1.0,
                 opaque_decay: 0.0,
                 transparency: 0.0,
+                normal: Vector3::new(0.0, 0.0, 1.0),
             })
         })
         .push_sphere(&SphereGeometry {
@@ -944,6 +958,7 @@ fn main() {
                 refraction_index: 1.12,
                 opaque_decay: 0.3,
                 transparency: 0.96,
+                normal: Vector3::new(0.0, 0.0, 1.0),
             })
         })
         .push_sphere(&SphereGeometry {
@@ -961,6 +976,7 @@ fn main() {
                         return LinSrgb::new(0.1, 0.1, 1.0);
                     }
                 },
+                normal_fn: |uv| { Vector3::new(0.0, 0.0, 1.0) },
                 shiness: 0.3,
                 specular_color: consts::linsrgb::blue(),
                 smoothness: 0.7,
@@ -984,6 +1000,7 @@ fn main() {
                 refraction_index: 1.0,
                 opaque_decay: 0.0,
                 transparency: 0.0,
+                normal: Vector3::new(0.0, 0.0, 1.0),
             })
         })
         .push_sphere(&SphereGeometry {
