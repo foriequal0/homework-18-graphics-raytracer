@@ -567,7 +567,7 @@ impl World {
                         view_direction: -hit.ray.direction,
                         light_direction: reflected.direction,
                     });
-                    return self.get_shade(&scattered_hit).mix(&s, 0.5);
+                    return self.get_shade(&reflected_hit).mix(&s, 0.5);
                 } else {
                     return self.get_shade(&scattered_hit);
                 }
@@ -586,7 +586,7 @@ impl World {
                         view_direction: -hit.ray.direction,
                         light_direction: reflected.direction,
                     });
-                    return self.get_shade(&scattered_hit).mix(&s, 0.5);
+                    return self.get_shade(&reflected_hit).mix(&s, 0.5);
                 } else {
                     return self.get_shade(&scattered_hit);
                 }
@@ -601,7 +601,7 @@ impl World {
                     Refraction::Escaped { travel_distance, escape_ray } => {
                         if let Option::Some(refracted_hit) = self.cast(&escape_ray) {
                             let x = self.distributed_ray_trace(&mut state.nested(1.0), &refracted_hit);
-                            return x * material.opaque_decay.powf(travel_distance)
+                            return (x + self.get_shade(&refracted_hit)) * material.opaque_decay.powf(travel_distance)
                         } else {
                             return LinSrgb::new(0.0, 0.0, 0.0);
                         }
@@ -780,7 +780,7 @@ fn main() {
         .push_object(Object {
             material: Arc::new(ColorMaterial {
                 diffuse_color: (1.0, 0.8, 0.6).into(),
-                shiness: 0.8,
+                shiness: 0.5,
                 specular_color: consts::linsrgb::white(),
                 smoothness: 0.01,
                 refraction_index: 1.0,
@@ -1017,17 +1017,18 @@ fn main() {
         up: Vector3::new(0.0, 1.0, 0.0).normalize(),
         near: -0.1,
     };
-
-    let mut img = Image::<LinSrgb>::new(1280, 960);
+    let width = 640;
+    let height = 480;
+    let mut img = Image::<LinSrgb>::new(width, height);
     {
         let mut sw = Stopwatch::start_new();
-        let screen_positions: Vec<_> = iproduct!(0..img.height, 0..img.width).collect::<Vec<_>>();
+        let screen_positions: Vec<_> = iproduct!(0..height, 0..width).collect::<Vec<_>>();
         let photons = screen_positions.par_iter()
             .cloned()
             .map(|at| {
                 let (y, x) = at;
-                let clip_y = (img.height as f32 / 2.0 - y as f32) / img.height as f32;
-                let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
+                let clip_y = (height as f32 / 2.0 - y as f32) / height as f32;
+                let clip_x = (x as f32 - width as f32 / 2.0) / height as f32;
                 let ray = camera.shoot(&Vector2::new(clip_x, clip_y));
                 let state = TraceState {
                     depth: 5,
@@ -1049,7 +1050,7 @@ fn main() {
         write_to_file("./out.png", &img);
     }
 
-    let mut distribute_states: Vec<_> = iproduct!(0..img.height, 0..img.width)
+    let mut distribute_states: Vec<_> = iproduct!(0..height, 0..width)
         .map(|at| {;
             let seed = at.0 as u64 * (2<<32) + at.1 as u64;
             DistributeState {
@@ -1066,8 +1067,8 @@ fn main() {
         let photons = distribute_states.par_iter_mut()
             .map(|mut state| {
                 let (y, x) = state.coord;
-                let clip_y = (img.height as f32 / 2.0 - y as f32) / img.height as f32;
-                let clip_x = (x as f32 - img.width as f32 / 2.0) / img.height as f32;
+                let clip_y = (height as f32 / 2.0 - y as f32) / height as f32;
+                let clip_x = (x as f32 - width as f32 / 2.0) / height as f32;
 
                 let mut state = DistributeState {
                     coord: state.coord,
