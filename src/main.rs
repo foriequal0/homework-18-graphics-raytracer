@@ -8,6 +8,7 @@ extern crate png;
 extern crate stopwatch;
 extern crate rayon;
 extern crate rand;
+extern crate tobj;
 
 mod photon;
 mod image;
@@ -774,8 +775,54 @@ fn write_to_file(name: &str, img: &Image<LinSrgb>) {
     rename("./tmp.png", name).unwrap();
 }
 
+fn load_obj(name: &str) -> Vec<[PositionNormalUV;3]> {
+    use std::fs::File;
+    use std::io::BufReader;
+    use std::path::Path;
+    use tobj;
+
+    let cornell_box = tobj::load_obj(&Path::new(name));
+    assert!(cornell_box.is_ok());
+    let (models, materials) = cornell_box.unwrap();
+    let mesh = &models[0].mesh;
+    let mut buf = Vec::new();
+	for f in 0..mesh.indices.len() / 3 {
+		let idx = [mesh.indices[3 * f] as usize, mesh.indices[3 * f + 1] as usize, mesh.indices[3 * f + 2] as usize];
+        let vertices = [
+            [mesh.positions[3 * idx[0]], mesh.positions[3 * idx[0] + 1], mesh.positions[3 * idx[0] + 2]],
+            [mesh.positions[3 * idx[1]], mesh.positions[3 * idx[1] + 1], mesh.positions[3 * idx[1] + 2]],
+            [mesh.positions[3 * idx[2]], mesh.positions[3 * idx[2] + 1], mesh.positions[3 * idx[2] + 2]],
+        ];
+        let mut puv = [
+            PositionUV{position: Point3::new(vertices[0][0], vertices[0][1], vertices[0][2]), uv: Point2::new(0.0, 0.0) },
+            PositionUV{position: Point3::new(vertices[1][0], vertices[1][1], vertices[1][2]), uv: Point2::new(0.0, 0.0) },
+            PositionUV{position: Point3::new(vertices[2][0], vertices[2][1], vertices[2][2]), uv: Point2::new(0.0, 0.0) },
+        ];
+        for p in &mut puv {
+            p.position = p.position / 3.0 + Vector3::new(0.7, 1.0, -0.5);
+        }
+        buf.push(triangle(&puv));
+	}
+    buf
+}
+
 fn main() {
+    let obj = load_obj("dodecahedron.obj");
     let mut world = World::new();
+    world
+        .push_object(Object {
+            material: Arc::new(ColorMaterial {
+                diffuse_color: (1.0, 1.0, 1.0).into(),
+                shiness: 0.1,
+                specular_color: consts::linsrgb::white(),
+                smoothness: 1.0,
+                refraction_index: 1.0,
+                opaque_decay: 0.0,
+                transparency: 0.0,
+                normal: Vector3::new(0.0, 0.0, 1.0),
+            })
+        })
+        .push_triangles(&obj);
     world
         .push_object(Object {
             material: Arc::new(ColorMaterial {
@@ -1034,8 +1081,8 @@ fn main() {
         up: Vector3::new(0.0, 1.0, 0.0).normalize(),
         near: -0.1,
     };
-    let width = 640;
-    let height = 480;
+    let width = 1280;
+    let height = 960;
     let mut img = Image::<LinSrgb>::new(width, height);
     {
         let mut sw = Stopwatch::start_new();
@@ -1098,7 +1145,7 @@ fn main() {
                     &Vector2::new(clip_x, clip_y),
                     &mut state,
                     3.0,
-                    0.02
+                    0.04
                 );
                 if let Option::Some(hit) = world.cast(&ray) {
                     let photon = world.distributed_ray_trace(&mut state, &hit);
